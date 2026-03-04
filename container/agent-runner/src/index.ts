@@ -445,6 +445,113 @@ function getGeminiApiKey(sdkEnv: Record<string, string | undefined>): string {
   return sdkEnv.GEMINI_API_KEY || sdkEnv.GOOGLE_API_KEY || '';
 }
 
+function envEnabled(value: string | undefined): boolean {
+  if (!value) return false;
+  const normalized = value.trim().toLowerCase();
+  return (
+    normalized === '1' ||
+    normalized === 'true' ||
+    normalized === 'yes' ||
+    normalized === 'on'
+  );
+}
+
+function useVertexGemini(
+  sdkEnv: Record<string, string | undefined>,
+  apiKey: string,
+): boolean {
+  if (envEnabled(sdkEnv.GEMINI_USE_VERTEX)) return true;
+  if (envEnabled(sdkEnv.GOOGLE_GENAI_USE_VERTEXAI)) return true;
+  return apiKey.length === 0;
+}
+
+async function fetchMetadata(pathSuffix: string): Promise<string> {
+  const res = await fetch(
+    `http://metadata.google.internal/computeMetadata/v1/${pathSuffix}`,
+    {
+      method: 'GET',
+      headers: { 'Metadata-Flavor': 'Google' },
+    },
+  );
+  if (!res.ok) {
+    throw new Error(
+      `Metadata request failed (${res.status}): ${pathSuffix}`,
+    );
+  }
+  return (await res.text()).trim();
+}
+
+async function getVertexProjectId(
+  sdkEnv: Record<string, string | undefined>,
+): Promise<string> {
+  const configured =
+    sdkEnv.VERTEX_PROJECT_ID || sdkEnv.GOOGLE_CLOUD_PROJECT || '';
+  if (configured) return configured;
+  return fetchMetadata('project/project-id');
+}
+
+async function getGcpAccessToken(
+  sdkEnv: Record<string, string | undefined>,
+): Promise<string> {
+  if (sdkEnv.GOOGLE_ACCESS_TOKEN) return sdkEnv.GOOGLE_ACCESS_TOKEN;
+  const res = await fetch(
+    'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token',
+    {
+      method: 'GET',
+      headers: { 'Metadata-Flavor': 'Google' },
+    },
+  );
+  if (!res.ok) {
+    throw new Error(`Failed to get access token from metadata (${res.status})`);
+  }
+  const body = (await res.json()) as { access_token?: string };
+  if (!body.access_token) {
+    throw new Error('Metadata token response missing access_token');
+  }
+  return body.access_token;
+}
+
+function maskedPrefix(value: string): string {
+  const prefix = value.slice(0, 4);
+  return `${prefix}... (len=${value.length})`;
+}
+
+function logProviderSecretPreview(
+  provider: Provider,
+  sdkEnv: Record<string, string | undefined>,
+): void {
+  if (provider === 'gemini') {
+    const keyName = sdkEnv.GEMINI_API_KEY ? 'GEMINI_API_KEY' : 'GOOGLE_API_KEY';
+    const key = getGeminiApiKey(sdkEnv);
+    if (key) {
+      log(`Auth debug: ${keyName} prefix=${maskedPrefix(key)}`);
+      return;
+    }
+    if (envEnabled(sdkEnv.GEMINI_USE_VERTEX) || envEnabled(sdkEnv.GOOGLE_GENAI_USE_VERTEXAI)) {
+      log('Auth debug: no Gemini API key; Vertex mode requested via env');
+    } else {
+      log('Auth debug: no Gemini API key; will attempt Vertex ADC fallback');
+    }
+    return;
+  }
+
+  if (sdkEnv.ANTHROPIC_API_KEY) {
+    log(
+      `Auth debug: ANTHROPIC_API_KEY prefix=${maskedPrefix(sdkEnv.ANTHROPIC_API_KEY)}`,
+    );
+    return;
+  }
+  if (sdkEnv.CLAUDE_CODE_OAUTH_TOKEN) {
+    log(
+      `Auth debug: CLAUDE_CODE_OAUTH_TOKEN prefix=${maskedPrefix(
+        sdkEnv.CLAUDE_CODE_OAUTH_TOKEN,
+      )}`,
+    );
+    return;
+  }
+  log('Auth debug: no Claude auth secret present');
+}
+
 function buildMemoryContext(containerInput: ContainerInput): string {
   const sections: string[] = [];
 
@@ -743,11 +850,6 @@ async function runGeminiQuery(
   }
 
   const apiKey = getGeminiApiKey(sdkEnv);
-  if (!apiKey) {
-    throw new Error(
-      'GEMINI_API_KEY (or GOOGLE_API_KEY) is required when AGENT_PROVIDER=gemini',
-    );
-  }
 
   const model = sdkEnv.GEMINI_MODEL || 'gemini-2.0-flash';
   const { sessionId: effectiveSessionId, state } = loadGeminiSession(sessionId);
@@ -765,19 +867,43 @@ async function runGeminiQuery(
     { role: 'user', parts: [{ text: combinedPrompt }] },
   ];
 
-  const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
+  const requestBody = JSON.stringify({
+    systemInstruction: { parts: [{ text: systemInstruction }] },
+    contents,
+  });
+
+  let response: Response;
+  if (useVertexGemini(sdkEnv, apiKey)) {
+    const projectId = await getVertexProjectId(sdkEnv);
+    const location = sdkEnv.VERTEX_LOCATION || 'us-central1';
+    const version = sdkEnv.VERTEX_API_VERSION || 'v1beta1';
+    const accessToken = await getGcpAccessToken(sdkEnv);
+    log(
+      `Gemini mode: Vertex AI (${location}) project=${projectId} model=${model}`,
+    );
+    response = await fetch(
+      `https://${location}-aiplatform.googleapis.com/${version}/projects/${encodeURIComponent(projectId)}/locations/${encodeURIComponent(location)}/publishers/google/models/${encodeURIComponent(model)}:generateContent`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: requestBody,
       },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: systemInstruction }] },
-        contents,
-      }),
-    },
-  );
+    );
+  } else {
+    response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: requestBody,
+      },
+    );
+  }
 
   if (!response.ok) {
     const errorText = await response.text();
@@ -863,6 +989,7 @@ async function main(): Promise<void> {
 
   const provider = resolveProvider(sdkEnv);
   log(`Using provider: ${provider}`);
+  logProviderSecretPreview(provider, sdkEnv);
 
   if (provider === 'gemini') {
     log(
