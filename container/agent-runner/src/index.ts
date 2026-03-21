@@ -16,6 +16,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import { GoogleGenAI } from '@google/genai';
 import {
   query,
   HookCallback,
@@ -867,51 +868,43 @@ async function runGeminiQuery(
     { role: 'user', parts: [{ text: combinedPrompt }] },
   ];
 
-  const requestBody = JSON.stringify({
-    systemInstruction: { parts: [{ text: systemInstruction }] },
-    contents,
-  });
-
-  let response: Response;
+  let client: GoogleGenAI;
   if (useVertexGemini(sdkEnv, apiKey)) {
     const projectId = await getVertexProjectId(sdkEnv);
-    const location = sdkEnv.VERTEX_LOCATION || 'us-central1';
-    const version = sdkEnv.VERTEX_API_VERSION || 'v1beta1';
-    const accessToken = await getGcpAccessToken(sdkEnv);
+    const location =
+      sdkEnv.VERTEX_LOCATION || sdkEnv.GOOGLE_CLOUD_LOCATION || 'us-central1';
     log(
       `Gemini mode: Vertex AI (${location}) project=${projectId} model=${model}`,
     );
-    response = await fetch(
-      `https://${location}-aiplatform.googleapis.com/${version}/projects/${encodeURIComponent(projectId)}/locations/${encodeURIComponent(location)}/publishers/google/models/${encodeURIComponent(model)}:generateContent`,
-      {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          'Content-Type': 'application/json',
-        },
-        body: requestBody,
-      },
-    );
+    client = new GoogleGenAI({
+      vertexai: true,
+      project: projectId,
+      location,
+    });
   } else {
-    response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: requestBody,
+    client = new GoogleGenAI({ apiKey });
+  }
+
+  let response: unknown;
+  try {
+    response = await client.models.generateContent({
+      model,
+      contents,
+      config: {
+        systemInstruction,
       },
-    );
+    });
+  } catch (error) {
+    const msg =
+      error instanceof Error ? error.message : `Unknown Gemini SDK error: ${String(error)}`;
+    throw new Error(msg);
   }
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Gemini API error (${response.status}): ${errorText}`);
-  }
-
-  const json = (await response.json()) as GeminiGenerateResponse;
-  const textResult = normalizeGeminiText(json);
+  const sdkText =
+    response && typeof response === 'object' && 'text' in response
+      ? String((response as { text?: unknown }).text || '').trim()
+      : '';
+  const textResult = sdkText || normalizeGeminiText(response as GeminiGenerateResponse);
   if (!textResult) {
     throw new Error('Gemini returned no text output');
   }
