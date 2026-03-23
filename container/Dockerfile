@@ -24,7 +24,15 @@ RUN apt-get update && apt-get install -y \
     libxshmfence1 \
     curl \
     git \
+    python3 \
+    python3-pip \
     && rm -rf /var/lib/apt/lists/*
+
+# Install Python data tooling used by generated accounting transformation scripts.
+RUN python3 -m pip install --break-system-packages --no-cache-dir \
+    pandas \
+    openpyxl \
+    xlrd
 
 # Set Chromium path for agent-browser
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
