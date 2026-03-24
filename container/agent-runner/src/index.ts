@@ -16,6 +16,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import { spawn } from 'child_process';
 import { GoogleGenAI } from '@google/genai';
 import {
   query,
@@ -65,6 +66,11 @@ interface QueryResult {
   newSessionId?: string;
   lastAssistantUuid?: string;
   closedDuringQuery: boolean;
+}
+
+interface ExecutedGeminiResult {
+  handled: boolean;
+  resultText: string;
 }
 
 type Provider = 'claude' | 'gemini';
@@ -658,6 +664,110 @@ function buildGeminiSystemInstruction(containerInput: ContainerInput): string {
   return `${base}\n\nUse this persistent memory context if relevant:\n\n${memory}`;
 }
 
+function extractFencedBlock(text: string, language: string): string | null {
+  const pattern = new RegExp(String.raw`\`\`\`${language}\n([\s\S]*?)\n\`\`\``, 'i');
+  const match = text.match(pattern);
+  return match ? match[1].trim() : null;
+}
+
+function extractLastJsonObject(text: string): Record<string, unknown> | null {
+  const jsonBlock = extractFencedBlock(text, 'json');
+  if (jsonBlock) {
+    try {
+      return JSON.parse(jsonBlock) as Record<string, unknown>;
+    } catch {
+      // Fall through to brace scanning.
+    }
+  }
+
+  const start = text.lastIndexOf('{');
+  const end = text.lastIndexOf('}');
+  if (start >= 0 && end > start) {
+    try {
+      return JSON.parse(text.slice(start, end + 1)) as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+async function executePythonScript(
+  scriptSource: string,
+): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
+  const tmpDir = '/workspace/group/.nanoclaw/runtime';
+  fs.mkdirSync(tmpDir, { recursive: true });
+  const scriptPath = path.join(tmpDir, `gemini_exec_${Date.now().toString(36)}.py`);
+  fs.writeFileSync(scriptPath, scriptSource);
+
+  return new Promise((resolve, reject) => {
+    const child = spawn('python3', [scriptPath], {
+      cwd: '/workspace/group',
+      env: process.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => {
+      stdout += String(chunk);
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += String(chunk);
+    });
+    child.on('error', reject);
+    child.on('close', (exitCode) => {
+      resolve({ stdout, stderr, exitCode });
+    });
+  });
+}
+
+async function maybeExecuteGeminiCodeResult(
+  textResult: string,
+): Promise<ExecutedGeminiResult> {
+  const pythonBlock = extractFencedBlock(textResult, 'python');
+  if (!pythonBlock) {
+    return { handled: false, resultText: textResult };
+  }
+
+  log('Gemini returned fenced Python; executing script in workspace.');
+  const execution = await executePythonScript(pythonBlock);
+  const stdout = execution.stdout.trim();
+  const stderr = execution.stderr.trim();
+
+  if (execution.exitCode !== 0) {
+    const errorText = stderr || stdout || `Python exited with code ${execution.exitCode}`;
+    throw new Error(`Gemini-generated Python failed: ${errorText}`);
+  }
+
+  const parsedJson = extractLastJsonObject(stdout);
+  if (parsedJson) {
+    return {
+      handled: true,
+      resultText: JSON.stringify(parsedJson),
+    };
+  }
+
+  const outputFiles = Array.from(
+    stdout.matchAll(/output\/final\/[^\s"'`]+/g),
+    (match) => match[0],
+  );
+  if (outputFiles.length > 0) {
+    return {
+      handled: true,
+      resultText: JSON.stringify({
+        confidence: 1.0,
+        output_files: outputFiles,
+        stdout: stdout.slice(0, 2000),
+      }),
+    };
+  }
+
+  return {
+    handled: true,
+    resultText: stdout || textResult,
+  };
+}
+
 /**
  * Run a single Claude query and stream results via writeOutput.
  */
@@ -904,9 +1014,14 @@ async function runGeminiQuery(
     response && typeof response === 'object' && 'text' in response
       ? String((response as { text?: unknown }).text || '').trim()
       : '';
-  const textResult = sdkText || normalizeGeminiText(response as GeminiGenerateResponse);
+  let textResult = sdkText || normalizeGeminiText(response as GeminiGenerateResponse);
   if (!textResult) {
     throw new Error('Gemini returned no text output');
+  }
+
+  const executed = await maybeExecuteGeminiCodeResult(textResult);
+  if (executed.handled) {
+    textResult = executed.resultText;
   }
 
   const lastAssistantUuid = `gemini-${Date.now().toString(36)}`;
@@ -1043,6 +1158,15 @@ async function main(): Promise<void> {
       // idle timer and cause a 30-min delay before the next _close).
       if (queryResult.closedDuringQuery) {
         log('Close sentinel consumed during query, exiting');
+        break;
+      }
+
+      // Marathon invokes the Gemini runner as a single-turn batch executor.
+      // Once a result has been emitted, do not fall back into the interactive
+      // IPC loop or the container will idle indefinitely waiting for a follow-up
+      // message that never comes.
+      if (provider === 'gemini' && containerInput.groupFolder === 'marathon') {
+        log('Gemini marathon query completed, exiting single-turn runner');
         break;
       }
 
