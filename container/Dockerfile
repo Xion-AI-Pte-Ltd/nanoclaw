@@ -32,7 +32,8 @@ RUN apt-get update && apt-get install -y \
 RUN python3 -m pip install --break-system-packages --no-cache-dir \
     pandas \
     openpyxl \
-    xlrd
+    xlrd \
+    xlsxwriter
 
 # Set Chromium path for agent-browser
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
