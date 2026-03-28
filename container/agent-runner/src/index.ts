@@ -952,6 +952,10 @@ async function ensurePythonDependencies(scriptSource: string): Promise<void> {
 
 async function maybeExecuteGeminiCodeResult(
   textResult: string,
+  client: GoogleGenAI,
+  model: string,
+  contents: GeminiPromptContent[],
+  systemInstruction: string,
 ): Promise<ExecutedGeminiResult> {
   const pythonBlock = extractFencedBlock(textResult, 'python');
   if (!pythonBlock) {
@@ -1011,13 +1015,7 @@ async function maybeExecuteGeminiCodeResult(
     }
 
     log(`Gemini Python failed at runtime; requesting corrected script once. Error: ${errorText}`);
-    const correctedScript = await requestGeminiPythonCorrection(
-      client,
-      model,
-      contents,
-      systemInstruction,
-      errorText,
-    );
+    const correctedScript = await requestGeminiPythonCorrection(client, model, contents, systemInstruction, errorText);
     const correctedTemplateMarker = detectTemplateScriptMarker(correctedScript);
     if (correctedTemplateMarker) {
       throw new GeminiTemplateScriptError(correctedTemplateMarker);
@@ -1341,7 +1339,7 @@ async function runGeminiQuery(
   let executed: ExecutedGeminiResult | null = null;
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
-      executed = await maybeExecuteGeminiCodeResult(textResult);
+      executed = await maybeExecuteGeminiCodeResult(textResult, client, model, contents, systemInstruction);
       if (executed.handled) {
         textResult = executed.resultText;
       }
