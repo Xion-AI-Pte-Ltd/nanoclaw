@@ -16,7 +16,7 @@
 
 import fs from 'fs';
 import path from 'path';
-import { spawn } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
 import { GoogleGenAI } from '@google/genai';
 import {
   query,
@@ -73,7 +73,18 @@ interface ExecutedGeminiResult {
   resultText: string;
 }
 
+class GeminiTemplateScriptError extends Error {
+  marker: string;
+
+  constructor(marker: string) {
+    super(`Gemini returned templated Python scaffold containing ${marker}`);
+    this.name = 'GeminiTemplateScriptError';
+    this.marker = marker;
+  }
+}
+
 type Provider = 'claude' | 'gemini';
+const MISSING_MODULE_REGEX = /No module named ['"]([^'"]+)['"]/i;
 
 interface GeminiHistoryMessage {
   role: 'user' | 'model';
@@ -100,6 +111,11 @@ interface GeminiCandidate {
 interface GeminiGenerateResponse {
   candidates?: GeminiCandidate[];
 }
+
+type GeminiPromptContent = {
+  role: 'user' | 'model';
+  parts: Array<{ text: string }>;
+};
 
 const IPC_INPUT_DIR = '/workspace/ipc/input';
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
@@ -452,6 +468,30 @@ function getGeminiApiKey(sdkEnv: Record<string, string | undefined>): string {
   return sdkEnv.GEMINI_API_KEY || sdkEnv.GOOGLE_API_KEY || '';
 }
 
+function getGeminiVertexProjectId(
+  sdkEnv: Record<string, string | undefined>,
+): string {
+  const configured =
+    sdkEnv.VERTEX_PROJECT_ID ||
+    sdkEnv.GOOGLE_CLOUD_PROJECT ||
+    sdkEnv.RUNTIME_PROJECT_ID ||
+    sdkEnv.GCP_PROJECT ||
+    sdkEnv.GCLOUD_PROJECT ||
+    'vault-dev-270023';
+  return configured.trim();
+}
+
+function getGeminiVertexLocation(
+  sdkEnv: Record<string, string | undefined>,
+): string {
+  const configured =
+    sdkEnv.VERTEX_LOCATION ||
+    sdkEnv.GOOGLE_CLOUD_LOCATION ||
+    sdkEnv.GEMINI_LOCATION ||
+    'global';
+  return configured.trim();
+}
+
 function envEnabled(value: string | undefined): boolean {
   if (!value) return false;
   const normalized = value.trim().toLowerCase();
@@ -461,15 +501,6 @@ function envEnabled(value: string | undefined): boolean {
     normalized === 'yes' ||
     normalized === 'on'
   );
-}
-
-function useVertexGemini(
-  sdkEnv: Record<string, string | undefined>,
-  apiKey: string,
-): boolean {
-  if (envEnabled(sdkEnv.GEMINI_USE_VERTEX)) return true;
-  if (envEnabled(sdkEnv.GOOGLE_GENAI_USE_VERTEXAI)) return true;
-  return apiKey.length === 0;
 }
 
 async function fetchMetadata(pathSuffix: string): Promise<string> {
@@ -528,17 +559,17 @@ function logProviderSecretPreview(
   sdkEnv: Record<string, string | undefined>,
 ): void {
   if (provider === 'gemini') {
-    const keyName = sdkEnv.GEMINI_API_KEY ? 'GEMINI_API_KEY' : 'GOOGLE_API_KEY';
     const key = getGeminiApiKey(sdkEnv);
     if (key) {
+      const keyName = sdkEnv.GEMINI_API_KEY ? 'GEMINI_API_KEY' : 'GOOGLE_API_KEY';
       log(`Auth debug: ${keyName} prefix=${maskedPrefix(key)}`);
       return;
     }
-    if (envEnabled(sdkEnv.GEMINI_USE_VERTEX) || envEnabled(sdkEnv.GOOGLE_GENAI_USE_VERTEXAI)) {
-      log('Auth debug: no Gemini API key; Vertex mode requested via env');
-    } else {
-      log('Auth debug: no Gemini API key; will attempt Vertex ADC fallback');
-    }
+    log(
+      `Auth debug: no Gemini API key present; using Vertex AI ADC fallback project=${getGeminiVertexProjectId(
+        sdkEnv,
+      )} location=${getGeminiVertexLocation(sdkEnv)}`,
+    );
     return;
   }
 
@@ -658,16 +689,56 @@ function buildGeminiSystemInstruction(containerInput: ContainerInput): string {
   const memory = buildMemoryContext(containerInput);
   const base =
     'You are NanoClaw, a coding and task assistant running inside an isolated workspace container. ' +
-    'Be concise, accurate, and explicit about limitations.';
+    'Be concise, accurate, and explicit about limitations. ' +
+    'If a Python execution fails due to a missing module, correct the issue by installing the dependency and retrying before giving up. ' +
+    'If the task involves PDFs, do not write local PDF parsing code; use Gemini-based extraction of the PDF content or structured fields instead of local read/parsing libraries. ' +
+    'Prefer direct Google GenAI API usage for Gemini work. Do not rely on Vertex AI mode.';
   if (!memory) return base;
 
   return `${base}\n\nUse this persistent memory context if relevant:\n\n${memory}`;
+}
+
+function extractMissingPythonModule(errorText: string): string | null {
+  const match = errorText.match(MISSING_MODULE_REGEX);
+  if (!match) return null;
+  const moduleName = match[1].trim();
+  return moduleName || null;
 }
 
 function extractFencedBlock(text: string, language: string): string | null {
   const pattern = new RegExp(String.raw`\`\`\`${language}\n([\s\S]*?)\n\`\`\``, 'i');
   const match = text.match(pattern);
   return match ? match[1].trim() : null;
+}
+
+function detectTemplateScriptMarker(scriptSource: string): string | null {
+  const lowered = scriptSource.toLowerCase();
+  const markers = [
+    'dummy_json_content',
+    'cash_flow_actuals',
+    'cash_flow_budget',
+    'sample dataset',
+    'sample data',
+    'example dataset',
+    'example data',
+    'synthetic data',
+    'placeholder data',
+    'mock data',
+    'demo data',
+    'lorem ipsum',
+  ];
+
+  for (const marker of markers) {
+    if (lowered.includes(marker)) {
+      return marker;
+    }
+  }
+
+  if (lowered.includes('create_empty_workbook_with_note(')) {
+    return 'create_empty_workbook_with_note';
+  }
+
+  return null;
 }
 
 function extractLastJsonObject(text: string): Record<string, unknown> | null {
@@ -694,11 +765,21 @@ function extractLastJsonObject(text: string): Record<string, unknown> | null {
 
 async function executePythonScript(
   scriptSource: string,
+  allowDependencyRepair = true,
 ): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
   const tmpDir = '/workspace/group/.nanoclaw/runtime';
+  const finalOutputDir = '/workspace/group/output/final';
   fs.mkdirSync(tmpDir, { recursive: true });
+  fs.mkdirSync(finalOutputDir, { recursive: true });
   const scriptPath = path.join(tmpDir, `gemini_exec_${Date.now().toString(36)}.py`);
-  fs.writeFileSync(scriptPath, scriptSource);
+  const bootstrap = [
+    'import os',
+    "os.chdir('/workspace/group')",
+    "os.makedirs('output/final', exist_ok=True)",
+    "os.makedirs('/workspace/group/output/final', exist_ok=True)",
+    '',
+  ].join('\n');
+  fs.writeFileSync(scriptPath, bootstrap + scriptSource);
 
   return new Promise((resolve, reject) => {
     const child = spawn('python3', [scriptPath], {
@@ -721,6 +802,147 @@ async function executePythonScript(
   });
 }
 
+async function requestGeminiPythonCorrection(
+  client: GoogleGenAI,
+  model: string,
+  contents: GeminiPromptContent[],
+  systemInstruction: string,
+  marker: string,
+): Promise<string> {
+  const retryResponse = await client.models.generateContent({
+    model,
+    contents: [
+      ...contents,
+      {
+        role: 'user',
+        parts: [
+          {
+            text:
+              'The previous Python output was invalid because it used templated or synthetic content. ' +
+              `Rejected marker: ${marker}. ` +
+              'Regenerate a real script that reads the staged report bundle from input/, uses the staged data as the only source of truth, ' +
+              'does not embed dummy_json_content or sample datasets, and writes final deliverables only under output/final.',
+          },
+        ],
+      },
+    ],
+    config: {
+      systemInstruction,
+    },
+  });
+
+  const retrySdkText =
+    retryResponse && typeof retryResponse === 'object' && 'text' in retryResponse
+      ? String((retryResponse as { text?: unknown }).text || '').trim()
+      : '';
+  return (retrySdkText || normalizeGeminiText(retryResponse as GeminiGenerateResponse)).trim();
+}
+
+async function installPythonPackage(packageName: string): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn('python3', [
+      '-m',
+      'pip',
+      'install',
+      '--break-system-packages',
+      '--no-cache-dir',
+      packageName,
+    ], {
+      cwd: '/workspace/group',
+      env: process.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stderr = '';
+    child.stderr.on('data', (chunk) => {
+      stderr += String(chunk);
+    });
+    child.on('error', reject);
+    child.on('close', (exitCode) => {
+      if (exitCode === 0) {
+        resolve();
+        return;
+      }
+      reject(new Error(stderr || `pip install ${packageName} exited with code ${exitCode}`));
+    });
+  });
+}
+
+function pythonModuleExists(moduleName: string): boolean {
+  const probe = spawnSync(
+    'python3',
+    [
+      '-c',
+      'import importlib.util, sys; sys.exit(0 if importlib.util.find_spec(sys.argv[1]) else 1)',
+      moduleName,
+    ],
+    {
+      cwd: '/workspace/group',
+      env: process.env,
+      stdio: 'ignore',
+    },
+  );
+  return probe.status === 0;
+}
+
+async function ensurePythonDependencies(scriptSource: string): Promise<void> {
+  const imports = new Set<string>();
+  const importRegex = /^\s*import\s+([a-zA-Z0-9_.,\s]+)$/gm;
+  const fromRegex = /^\s*from\s+([a-zA-Z0-9_\.]+)\s+import\s+/gm;
+
+  for (const match of scriptSource.matchAll(importRegex)) {
+    const raw = (match[1] || '').split(',');
+    for (const item of raw) {
+      const moduleName = item.trim().split(/\s+as\s+/i)[0]?.split('.')[0]?.trim();
+      if (moduleName) imports.add(moduleName);
+    }
+  }
+
+  for (const match of scriptSource.matchAll(fromRegex)) {
+    const moduleName = (match[1] || '').split('.')[0]?.trim();
+    if (moduleName) imports.add(moduleName);
+  }
+
+  const builtins = new Set([
+    'os',
+    'sys',
+    'json',
+    're',
+    'math',
+    'time',
+    'datetime',
+    'pathlib',
+    'typing',
+    'collections',
+    'subprocess',
+    'shutil',
+    'tempfile',
+    'traceback',
+    'functools',
+    'itertools',
+    'statistics',
+    'csv',
+    'gzip',
+    'zipfile',
+    'hashlib',
+    'base64',
+    'urllib',
+    'http',
+  ]);
+
+  const missing: string[] = [];
+  for (const moduleName of imports) {
+    if (builtins.has(moduleName)) continue;
+    if (!pythonModuleExists(moduleName)) {
+      missing.push(moduleName);
+    }
+  }
+
+  for (const moduleName of missing) {
+    log(`Installing missing Python dependency inferred from script: ${moduleName}`);
+    await installPythonPackage(moduleName);
+  }
+}
+
 async function maybeExecuteGeminiCodeResult(
   textResult: string,
 ): Promise<ExecutedGeminiResult> {
@@ -729,13 +951,57 @@ async function maybeExecuteGeminiCodeResult(
     return { handled: false, resultText: textResult };
   }
 
+  const templateMarker = detectTemplateScriptMarker(pythonBlock);
+  if (templateMarker) {
+    throw new GeminiTemplateScriptError(templateMarker);
+  }
+
   log('Gemini returned fenced Python; executing script in workspace.');
+  await ensurePythonDependencies(pythonBlock);
   const execution = await executePythonScript(pythonBlock);
   const stdout = execution.stdout.trim();
   const stderr = execution.stderr.trim();
 
   if (execution.exitCode !== 0) {
     const errorText = stderr || stdout || `Python exited with code ${execution.exitCode}`;
+    const missingModule = extractMissingPythonModule(errorText);
+    if (missingModule) {
+      log(`Missing Python module detected at runtime; installing ${missingModule} and retrying once.`);
+      await installPythonPackage(missingModule);
+      const retryExecution = await executePythonScript(pythonBlock, false);
+      const retryStdout = retryExecution.stdout.trim();
+      const retryStderr = retryExecution.stderr.trim();
+      if (retryExecution.exitCode !== 0) {
+        const retryErrorText =
+          retryStderr || retryStdout || `Python exited with code ${retryExecution.exitCode}`;
+        throw new Error(`Gemini-generated Python failed: ${retryErrorText}`);
+      }
+      const retryParsedJson = extractLastJsonObject(retryStdout);
+      if (retryParsedJson) {
+        return {
+          handled: true,
+          resultText: JSON.stringify(retryParsedJson),
+        };
+      }
+      const retryOutputFiles = Array.from(
+        retryStdout.matchAll(/output\/final\/[^\s"'`]+/g),
+        (match) => match[0],
+      );
+      if (retryOutputFiles.length > 0) {
+        return {
+          handled: true,
+          resultText: JSON.stringify({
+            confidence: 1.0,
+            output_files: retryOutputFiles,
+            stdout: retryStdout.slice(0, 2000),
+          }),
+        };
+      }
+      return {
+        handled: true,
+        resultText: retryStdout || textResult,
+      };
+    }
     throw new Error(`Gemini-generated Python failed: ${errorText}`);
   }
 
@@ -970,7 +1236,7 @@ async function runGeminiQuery(
   const combinedPrompt =
     pending.length > 0 ? `${prompt}\n${pending.join('\n')}` : prompt;
 
-  const contents = [
+  const contents: GeminiPromptContent[] = [
     ...state.history.map((message) => ({
       role: message.role,
       parts: [{ text: message.text }],
@@ -979,20 +1245,20 @@ async function runGeminiQuery(
   ];
 
   let client: GoogleGenAI;
-  if (useVertexGemini(sdkEnv, apiKey)) {
-    const projectId = await getVertexProjectId(sdkEnv);
-    const location =
-      sdkEnv.VERTEX_LOCATION || sdkEnv.GOOGLE_CLOUD_LOCATION || 'us-central1';
-    log(
-      `Gemini mode: Vertex AI (${location}) project=${projectId} model=${model}`,
-    );
+  if (apiKey) {
+    client = new GoogleGenAI({ apiKey });
+    log(`Gemini mode: Google GenAI SDK model=${model} auth=api_key`);
+  } else {
+    const project = getGeminiVertexProjectId(sdkEnv);
+    const location = getGeminiVertexLocation(sdkEnv);
     client = new GoogleGenAI({
       vertexai: true,
-      project: projectId,
+      project,
       location,
     });
-  } else {
-    client = new GoogleGenAI({ apiKey });
+    log(
+      `Gemini mode: Google GenAI SDK model=${model} auth=vertex_adc project=${project} location=${location}`,
+    );
   }
 
   let response: unknown;
@@ -1019,8 +1285,27 @@ async function runGeminiQuery(
     throw new Error('Gemini returned no text output');
   }
 
-  const executed = await maybeExecuteGeminiCodeResult(textResult);
-  if (executed.handled) {
+  let executed: ExecutedGeminiResult | null = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      executed = await maybeExecuteGeminiCodeResult(textResult);
+      if (executed.handled) {
+        textResult = executed.resultText;
+      }
+      break;
+    } catch (error) {
+      if (error instanceof GeminiTemplateScriptError && attempt === 0) {
+        log(`Gemini Python looked templated (${error.marker}); requesting a corrected script once.`);
+        textResult = await requestGeminiPythonCorrection(client, model, contents, systemInstruction, error.marker);
+        if (!textResult) {
+          throw new Error('Gemini correction retry returned no text output');
+        }
+        continue;
+      }
+      throw error;
+    }
+  }
+  if (executed?.handled) {
     textResult = executed.resultText;
   }
 
