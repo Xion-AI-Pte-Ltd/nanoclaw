@@ -888,20 +888,25 @@ function pythonModuleExists(moduleName: string): boolean {
 
 async function ensurePythonDependencies(scriptSource: string): Promise<void> {
   const imports = new Set<string>();
-  const importRegex = /^\s*import\s+([a-zA-Z0-9_.,\s]+)$/gm;
-  const fromRegex = /^\s*from\s+([a-zA-Z0-9_\.]+)\s+import\s+/gm;
+  for (const rawLine of scriptSource.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
 
-  for (const match of scriptSource.matchAll(importRegex)) {
-    const raw = (match[1] || '').split(',');
-    for (const item of raw) {
-      const moduleName = item.trim().split(/\s+as\s+/i)[0]?.split('.')[0]?.trim();
+    const importMatch = line.match(/^import\s+([a-zA-Z0-9_.,\s]+)$/);
+    if (importMatch) {
+      const raw = (importMatch[1] || '').split(',');
+      for (const item of raw) {
+        const moduleName = item.trim().split(/\s+as\s+/i)[0]?.split('.')[0]?.trim();
+        if (moduleName) imports.add(moduleName);
+      }
+      continue;
+    }
+
+    const fromMatch = line.match(/^from\s+([a-zA-Z0-9_\.]+)\s+import\s+/);
+    if (fromMatch) {
+      const moduleName = (fromMatch[1] || '').split('.')[0]?.trim();
       if (moduleName) imports.add(moduleName);
     }
-  }
-
-  for (const match of scriptSource.matchAll(fromRegex)) {
-    const moduleName = (match[1] || '').split('.')[0]?.trim();
-    if (moduleName) imports.add(moduleName);
   }
 
   const builtins = new Set([
