@@ -1009,7 +1009,53 @@ async function maybeExecuteGeminiCodeResult(
         resultText: retryStdout || textResult,
       };
     }
-    throw new Error(`Gemini-generated Python failed: ${errorText}`);
+
+    log(`Gemini Python failed at runtime; requesting corrected script once. Error: ${errorText}`);
+    const correctedScript = await requestGeminiPythonCorrection(
+      client,
+      model,
+      contents,
+      systemInstruction,
+      errorText,
+    );
+    const correctedTemplateMarker = detectTemplateScriptMarker(correctedScript);
+    if (correctedTemplateMarker) {
+      throw new GeminiTemplateScriptError(correctedTemplateMarker);
+    }
+    await ensurePythonDependencies(correctedScript);
+    const correctedExecution = await executePythonScript(correctedScript, false);
+    const correctedStdout = correctedExecution.stdout.trim();
+    const correctedStderr = correctedExecution.stderr.trim();
+    if (correctedExecution.exitCode !== 0) {
+      const correctedErrorText =
+        correctedStderr || correctedStdout || `Python exited with code ${correctedExecution.exitCode}`;
+      throw new Error(`Gemini-generated Python failed: ${correctedErrorText}`);
+    }
+    const correctedParsedJson = extractLastJsonObject(correctedStdout);
+    if (correctedParsedJson) {
+      return {
+        handled: true,
+        resultText: JSON.stringify(correctedParsedJson),
+      };
+    }
+    const correctedOutputFiles = Array.from(
+      correctedStdout.matchAll(/output\/final\/[^\s"'`]+/g),
+      (match) => match[0],
+    );
+    if (correctedOutputFiles.length > 0) {
+      return {
+        handled: true,
+        resultText: JSON.stringify({
+          confidence: 1.0,
+          output_files: correctedOutputFiles,
+          stdout: correctedStdout.slice(0, 2000),
+        }),
+      };
+    }
+    return {
+      handled: true,
+      resultText: correctedStdout || textResult,
+    };
   }
 
   const parsedJson = extractLastJsonObject(stdout);
