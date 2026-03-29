@@ -220,6 +220,31 @@ def month_sort_key(month: str) -> tuple[int, int]:
         return (9999, 99)
 
 
+def month_endpoints(month: str) -> datetime | None:
+    try:
+        return datetime.strptime(f"{month}-01", "%Y-%m-%d")
+    except Exception:
+        return None
+
+
+def iter_month_series(start_month: str, end_month: str) -> list[str]:
+    start_dt = month_endpoints(start_month)
+    end_dt = month_endpoints(end_month)
+    if not start_dt or not end_dt:
+        return sorted({start_month, end_month}, key=month_sort_key)
+    if start_dt > end_dt:
+        start_dt, end_dt = end_dt, start_dt
+    series: list[str] = []
+    current = start_dt
+    while current <= end_dt:
+        series.append(current.strftime("%Y-%m"))
+        if current.month == 12:
+            current = current.replace(year=current.year + 1, month=1, day=1)
+        else:
+            current = current.replace(month=current.month + 1, day=1)
+    return series
+
+
 def write_headers(ws: xlsxwriter.workbook.Worksheet, row: int, headers: list[str], header_fmt: Any) -> None:
     for col, header in enumerate(headers):
         ws.write(row, col, header, header_fmt)
@@ -344,6 +369,25 @@ def main() -> int:
         summary["CashRows"] += 1
 
     months = sorted(monthly.keys(), key=month_sort_key)
+    time_window = report_request.get("time_window") if isinstance(report_request.get("time_window"), dict) else {}
+    requested_end_month = ""
+    if isinstance(time_window, dict):
+        requested_end = str(time_window.get("end_date") or time_window.get("end") or "").strip()
+        requested_end_month = parse_month(requested_end) if requested_end else ""
+    if months:
+        end_month = requested_end_month or months[-1]
+        months = iter_month_series(months[0], end_month)
+        for month in months:
+            monthly.setdefault(
+                month,
+                {
+                    "Operating": 0.0,
+                    "Investing": 0.0,
+                    "Financing": 0.0,
+                    "Net Cash Flow": 0.0,
+                    "Cash Rows": 0.0,
+                },
+            )
     variance_rows: list[dict[str, Any]] = []
     for index, month in enumerate(months):
         actual = round_currency(monthly[month]["Net Cash Flow"])

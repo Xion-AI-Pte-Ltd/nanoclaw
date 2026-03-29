@@ -35,6 +35,22 @@ interface ContainerInput {
   isScheduledTask?: boolean;
   assistantName?: string;
   secrets?: Record<string, string>;
+  inputFiles?: Array<{
+    uri?: string;
+    name?: string;
+    localPath?: string;
+    agentPath?: string;
+    sourceUri?: string;
+  }>;
+  stagedInputFiles?: Array<{
+    name?: string;
+    localPath?: string;
+    agentPath?: string;
+    sourceUri?: string;
+  }>;
+  reportBundlePath?: string;
+  reportBundleLocalPath?: string;
+  reportBundleSourceUri?: string;
 }
 
 interface ContainerOutput {
@@ -214,16 +230,63 @@ function findFileRecursive(rootDir: string, fileName: string): string | null {
   return null;
 }
 
-function findCashFlowVarianceBundlePath(): string | null {
-  const exactPath = path.resolve('/workspace/group/input', CASH_FLOW_VARIANCE_BUNDLE_NAME);
-  if (fs.existsSync(exactPath)) {
-    return exactPath;
+function findCashFlowVarianceBundlePath(containerInput: ContainerInput): string | null {
+  const candidatePaths: string[] = [];
+  const explicitPaths = [
+    containerInput.reportBundlePath,
+    containerInput.reportBundleLocalPath,
+  ];
+  for (const value of explicitPaths) {
+    if (typeof value !== 'string' || !value.trim()) {
+      continue;
+    }
+    const trimmed = value.trim();
+    candidatePaths.push(path.isAbsolute(trimmed) ? trimmed : path.resolve('/workspace/group', trimmed));
   }
-  const recursive = findFileRecursive('/workspace/group/input', CASH_FLOW_VARIANCE_BUNDLE_NAME);
-  if (recursive) {
-    return recursive;
+
+  const stagedFiles = Array.isArray(containerInput.stagedInputFiles) ? containerInput.stagedInputFiles : [];
+  for (const item of stagedFiles) {
+    if (!item || typeof item !== 'object') {
+      continue;
+    }
+    if (typeof item.agentPath === 'string' && item.agentPath.trim()) {
+      candidatePaths.push(path.resolve('/workspace/group', item.agentPath.trim()));
+    }
+    if (typeof item.localPath === 'string' && item.localPath.trim()) {
+      candidatePaths.push(path.resolve(item.localPath.trim()));
+    }
+    if (typeof item.name === 'string' && item.name.trim()) {
+      candidatePaths.push(path.resolve('/workspace/group/input', item.name.trim()));
+      candidatePaths.push(path.resolve('/workspace/group', item.name.trim()));
+    }
   }
-  return findFileRecursive('/workspace/group', CASH_FLOW_VARIANCE_BUNDLE_NAME);
+
+  const inputFiles = Array.isArray(containerInput.inputFiles) ? containerInput.inputFiles : [];
+  for (const item of inputFiles) {
+    if (!item || typeof item !== 'object') {
+      continue;
+    }
+    if (typeof item.name === 'string' && item.name.trim()) {
+      candidatePaths.push(path.resolve('/workspace/group/input', item.name.trim()));
+    }
+    if (typeof item.uri === 'string' && item.uri.trim()) {
+      const uriName = path.basename(item.uri.trim());
+      if (uriName) {
+        candidatePaths.push(path.resolve('/workspace/group/input', uriName));
+      }
+    }
+  }
+
+  candidatePaths.push(path.resolve('/workspace/group/input', CASH_FLOW_VARIANCE_BUNDLE_NAME));
+  candidatePaths.push(path.resolve('/workspace/group', CASH_FLOW_VARIANCE_BUNDLE_NAME));
+
+  for (const candidate of candidatePaths) {
+    if (candidate && fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+
+  return findFileRecursive('/workspace/group/input', CASH_FLOW_VARIANCE_BUNDLE_NAME) ?? findFileRecursive('/workspace/group', CASH_FLOW_VARIANCE_BUNDLE_NAME);
 }
 
 async function executePythonFile(
@@ -253,12 +316,13 @@ async function executePythonFile(
 
 async function maybeRunDeterministicCashFlowVarianceWorkbook(
   prompt: string,
+  containerInput: ContainerInput,
 ): Promise<{ handled: boolean; resultText: string }> {
   if (!isCashFlowVarianceTask(prompt)) {
     return { handled: false, resultText: '' };
   }
 
-  const bundlePath = findCashFlowVarianceBundlePath();
+  const bundlePath = findCashFlowVarianceBundlePath(containerInput);
   if (!bundlePath) {
     log('Cash flow variance bundle not found; falling back to Gemini generation.');
     return { handled: false, resultText: '' };
@@ -587,7 +651,7 @@ function getGeminiVertexProjectId(
     sdkEnv.RUNTIME_PROJECT_ID ||
     sdkEnv.GCP_PROJECT ||
     sdkEnv.GCLOUD_PROJECT ||
-    'vault-dev-270023';
+    'vault-249100';
   return configured.trim();
 }
 
@@ -1556,7 +1620,7 @@ async function runGeminiQuery(
   const combinedPrompt =
     pending.length > 0 ? `${prompt}\n${pending.join('\n')}` : prompt;
 
-  const deterministicVarianceReport = await maybeRunDeterministicCashFlowVarianceWorkbook(combinedPrompt);
+  const deterministicVarianceReport = await maybeRunDeterministicCashFlowVarianceWorkbook(combinedPrompt, containerInput);
   if (deterministicVarianceReport.handled) {
     const resultText = deterministicVarianceReport.resultText;
     const lastAssistantUuid = `gemini-${Date.now().toString(36)}`;
