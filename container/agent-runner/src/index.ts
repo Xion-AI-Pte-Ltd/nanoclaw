@@ -694,7 +694,11 @@ function buildGeminiSystemInstruction(containerInput: ContainerInput): string {
     'If the task involves PDFs, do not write local PDF parsing code; use Gemini-based extraction of the PDF content or structured fields instead of local read/parsing libraries. ' +
     'Prefer the Google GenAI SDK for Gemini work. If a Gemini API key is present, use direct API mode. ' +
     'If no API key is present, use Vertex AI with Google Application Default Credentials and do not fail solely because an API key is missing. ' +
-    'Do not invent a local PDF parser or require a Gemini API key when ADC is available.';
+    'Do not invent a local PDF parser or require a Gemini API key when ADC is available. ' +
+    'When creating spreadsheets with xlsxwriter, only use chart types that xlsxwriter supports. ' +
+    "Do not call add_chart('waterfall') or other unsupported chart types. " +
+    'If a waterfall visualization is requested, approximate it using supported chart types such as stacked bar or column charts and note the approximation in the workbook. ' +
+    'Treat trial_balance as optional and untrusted: it may be missing, null, a string, or another non-dict value. Only call .get() on it after checking isinstance(trial_balance, dict).';
   if (!memory) return base;
 
   return `${base}\n\nUse this persistent memory context if relevant:\n\n${memory}`;
@@ -713,12 +717,81 @@ function extractFencedBlock(text: string, language: string): string | null {
   return match ? match[1].trim() : null;
 }
 
+function normalizePythonScriptText(text: string): string {
+  const trimmed = text.trim();
+  const fenced = extractFencedBlock(trimmed, 'python') ?? extractFencedBlock(trimmed, 'py');
+  const body = (fenced || trimmed)
+    .replace(/^\s*```(?:python|py)?\s*\n/i, '')
+    .replace(/\n\s*```\s*$/i, '')
+    .replace(/^\s*(?:python|py)\s*$/im, '')
+    .trim();
+  return body;
+}
+
+function sanitizeGeminiPythonScript(scriptSource: string): {
+  script: string;
+  notes: string[];
+} {
+  let sanitized = scriptSource;
+  const notes: string[] = [];
+
+  if (/\btrial_balance\.get\(/.test(sanitized)) {
+    sanitized = sanitized.replace(
+      /\btrial_balance\.get\(/g,
+      '_nanoclaw_trial_balance_get(trial_balance, ',
+    );
+    notes.push(
+      'Rewrote direct trial_balance.get(...) calls to a guarded helper because trial_balance may be missing or non-dict.',
+    );
+  }
+
+  const waterfallReplacements: Array<[RegExp, string]> = [
+    [
+      /add_chart\(\s*\{\s*['"]type['"]\s*:\s*['"]waterfall['"]\s*\}\s*\)/g,
+      "add_chart({'type': 'column'})",
+    ],
+    [
+      /add_chart\(\s*['"]waterfall['"]\s*\)/g,
+      "add_chart('column')",
+    ],
+    [
+      /\{\s*['"]type['"]\s*:\s*['"]waterfall['"]\s*\}/g,
+      "{'type': 'column'}",
+    ],
+  ];
+  for (const [pattern, replacement] of waterfallReplacements) {
+    if (pattern.test(sanitized)) {
+      sanitized = sanitized.replace(pattern, replacement);
+      notes.push(
+        'Replaced an unsupported waterfall chart request with a supported column chart before execution.',
+      );
+    }
+  }
+
+  if (notes.length > 0) {
+    const prelude = [
+      'def _nanoclaw_trial_balance_get(value, key, default=None):',
+      '    if isinstance(value, dict):',
+      '        return value.get(key, default)',
+      '    return default',
+      '',
+    ].join('\n');
+    sanitized = `${prelude}${sanitized}`;
+  }
+
+  return { script: sanitized, notes };
+}
+
 function detectTemplateScriptMarker(scriptSource: string): string | null {
   const lowered = scriptSource.toLowerCase();
   const markers = [
     'dummy_json_content',
     'cash_flow_actuals',
     'cash_flow_budget',
+    'get_cash_flow',
+    'get_cash_balance',
+    'actual_cash_flow_items',
+    'budget_cash_flow_items',
     'sample dataset',
     'sample data',
     'example dataset',
@@ -809,8 +882,54 @@ async function requestGeminiPythonCorrection(
   model: string,
   contents: GeminiPromptContent[],
   systemInstruction: string,
-  marker: string,
+  failureContext: string,
 ): Promise<string> {
+  const contextHints: string[] = [];
+  const lowerContext = failureContext.toLowerCase();
+  if (lowerContext.includes("keyerror: 'data'") || lowerContext.includes('response[\'data\']') || lowerContext.includes('response["data"]')) {
+    contextHints.push(
+      "The bundle schema for this report uses datasets_by_key['general_ledger']['response']['result']['gl'] for ledger rows and datasets_by_key['chart_of_accounts']['response']['result'] for chart-of-accounts classifications. Do not access response['data'].",
+    );
+  }
+  if (lowerContext.includes("keyerror: 'account_id'") || lowerContext.includes('account_id')) {
+    contextHints.push(
+      "There is no account_id column in the ledger rows. Use the Account field from general_ledger rows and join it to the chart_of_accounts dict keyed by account name.",
+    );
+  }
+  if (lowerContext.includes("str' object has no attribute 'get'") || lowerContext.includes('trial_balance')) {
+    contextHints.push(
+      'trial_balance is optional and may not be a dict. Guard with isinstance(trial_balance, dict) before using .get(), otherwise treat it as unavailable and continue.',
+    );
+  }
+  if (lowerContext.includes('cash_flow_actuals') || lowerContext.includes('cash_flow_budget')) {
+    contextHints.push(
+      "Do not emit scaffold names such as cash_flow_actuals or cash_flow_budget. Read only the staged bundle datasets and their existing keys.",
+    );
+  }
+  if (lowerContext.includes('```python') || lowerContext.includes('leading "python" line')) {
+    contextHints.push(
+      'Return plain Python only. Do not wrap it in markdown fences and do not prefix it with the word python.',
+    );
+  }
+  if (
+    lowerContext.includes("unknown chart type 'waterfall'") ||
+    lowerContext.includes("chart.add_series(") ||
+    lowerContext.includes("add_chart('waterfall')")
+  ) {
+    contextHints.push(
+      'xlsxwriter does not support a waterfall chart type. Replace it with a supported chart, such as stacked bar or column, and do not call add_chart("waterfall").',
+    );
+  }
+  const codeSkeleton = [
+    'Use this bundle access pattern as the starting point:',
+    'bundle = json.load(open("input/financial_cash_flow_variance_analysis_bundle.json", "r", encoding="utf-8"))',
+    'datasets = bundle["datasets_by_key"]',
+    'gl_rows = datasets["general_ledger"]["response"]["result"]["gl"]',
+    'coa_map = datasets["chart_of_accounts"]["response"]["result"]',
+    'trial_balance = datasets.get("trial_balance", {}).get("response", {}).get("result")',
+    'Then build the workbook from those objects and write it to output/final/financial_cash_flow_variance_analysis.xlsx.',
+  ].join(' ');
+  const contextHintBlock = contextHints.length > 0 ? ` Additional correction hints: ${contextHints.join(' ')}` : '';
   const retryResponse = await client.models.generateContent({
     model,
     contents: [
@@ -821,9 +940,13 @@ async function requestGeminiPythonCorrection(
           {
             text:
               'The previous Python output was invalid because it used templated or synthetic content. ' +
-              `Rejected marker: ${marker}. ` +
+              `Rejected context: ${failureContext}. ` +
               'Regenerate a real script that reads the staged report bundle from input/, uses the staged data as the only source of truth, ' +
-              'does not embed dummy_json_content or sample datasets, and writes final deliverables only under output/final.',
+              'does not embed dummy_json_content or sample datasets, does not invent dataset names like cash_flow_actuals, cash_flow_budget, get_cash_flow, or get_cash_balance, ' +
+              'and writes final deliverables only under output/final.' +
+              ` ${codeSkeleton}` +
+              contextHintBlock +
+              ' Return only Python code with no markdown fences, no prose, and no leading "python" line.',
           },
         ],
       },
@@ -837,7 +960,7 @@ async function requestGeminiPythonCorrection(
     retryResponse && typeof retryResponse === 'object' && 'text' in retryResponse
       ? String((retryResponse as { text?: unknown }).text || '').trim()
       : '';
-  return (retrySdkText || normalizeGeminiText(retryResponse as GeminiGenerateResponse)).trim();
+  return normalizePythonScriptText(retrySdkText || normalizeGeminiText(retryResponse as GeminiGenerateResponse));
 }
 
 async function installPythonPackage(packageName: string): Promise<void> {
@@ -957,9 +1080,10 @@ async function maybeExecuteGeminiCodeResult(
   contents: GeminiPromptContent[],
   systemInstruction: string,
 ): Promise<ExecutedGeminiResult> {
-  const pythonBlock = extractFencedBlock(textResult, 'python');
+  const normalizedTextResult = normalizePythonScriptText(textResult);
+  const pythonBlock = extractFencedBlock(textResult, 'python') || normalizedTextResult;
   if (!pythonBlock) {
-    return { handled: false, resultText: textResult };
+    return { handled: false, resultText: normalizedTextResult || textResult };
   }
 
   const templateMarker = detectTemplateScriptMarker(pythonBlock);
@@ -967,9 +1091,14 @@ async function maybeExecuteGeminiCodeResult(
     throw new GeminiTemplateScriptError(templateMarker);
   }
 
+  const sanitized = sanitizeGeminiPythonScript(pythonBlock);
+  if (sanitized.notes.length > 0) {
+    log(`Gemini script sanitized before execution: ${sanitized.notes.join(' | ')}`);
+  }
+
   log('Gemini returned fenced Python; executing script in workspace.');
-  await ensurePythonDependencies(pythonBlock);
-  const execution = await executePythonScript(pythonBlock);
+  await ensurePythonDependencies(sanitized.script);
+  const execution = await executePythonScript(sanitized.script);
   const stdout = execution.stdout.trim();
   const stderr = execution.stderr.trim();
 
@@ -979,7 +1108,7 @@ async function maybeExecuteGeminiCodeResult(
     if (missingModule) {
       log(`Missing Python module detected at runtime; installing ${missingModule} and retrying once.`);
       await installPythonPackage(missingModule);
-      const retryExecution = await executePythonScript(pythonBlock, false);
+      const retryExecution = await executePythonScript(sanitized.script, false);
       const retryStdout = retryExecution.stdout.trim();
       const retryStderr = retryExecution.stderr.trim();
       if (retryExecution.exitCode !== 0) {
@@ -1016,12 +1145,17 @@ async function maybeExecuteGeminiCodeResult(
 
     log(`Gemini Python failed at runtime; requesting corrected script once. Error: ${errorText}`);
     const correctedScript = await requestGeminiPythonCorrection(client, model, contents, systemInstruction, errorText);
-    const correctedTemplateMarker = detectTemplateScriptMarker(correctedScript);
+    const normalizedCorrectedScript = normalizePythonScriptText(correctedScript);
+    const correctedTemplateMarker = detectTemplateScriptMarker(normalizedCorrectedScript);
     if (correctedTemplateMarker) {
       throw new GeminiTemplateScriptError(correctedTemplateMarker);
     }
-    await ensurePythonDependencies(correctedScript);
-    const correctedExecution = await executePythonScript(correctedScript, false);
+    const sanitizedCorrected = sanitizeGeminiPythonScript(normalizedCorrectedScript);
+    if (sanitizedCorrected.notes.length > 0) {
+      log(`Corrected Gemini script sanitized before execution: ${sanitizedCorrected.notes.join(' | ')}`);
+    }
+    await ensurePythonDependencies(sanitizedCorrected.script);
+    const correctedExecution = await executePythonScript(sanitizedCorrected.script, false);
     const correctedStdout = correctedExecution.stdout.trim();
     const correctedStderr = correctedExecution.stderr.trim();
     if (correctedExecution.exitCode !== 0) {
@@ -1050,11 +1184,11 @@ async function maybeExecuteGeminiCodeResult(
         }),
       };
     }
-    return {
-      handled: true,
-      resultText: correctedStdout || textResult,
-    };
-  }
+      return {
+        handled: true,
+        resultText: correctedStdout || textResult,
+      };
+    }
 
   const parsedJson = extractLastJsonObject(stdout);
   if (parsedJson) {
