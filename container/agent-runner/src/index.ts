@@ -190,10 +190,6 @@ async function readStdin(): Promise<string> {
 
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
-const CASH_FLOW_VARIANCE_BUNDLE_NAME = 'financial_cash_flow_variance_analysis_bundle.json';
-const CASH_FLOW_VARIANCE_OUTPUT_NAME = 'financial_cash_flow_variance_analysis.xlsx';
-const CASH_FLOW_VARIANCE_REPORT_TEXT = 'Your report is ready. You can download it here.';
-const CASH_FLOW_VARIANCE_PROMPT_MARKERS = ['cash flow variance analysis', 'variance_analysis'];
 
 function writeOutput(output: ContainerOutput): void {
   console.log(OUTPUT_START_MARKER);
@@ -203,11 +199,6 @@ function writeOutput(output: ContainerOutput): void {
 
 function log(message: string): void {
   console.error(`[agent-runner] ${message}`);
-}
-
-function isCashFlowVarianceTask(prompt: string): boolean {
-  const lowered = prompt.toLowerCase();
-  return CASH_FLOW_VARIANCE_PROMPT_MARKERS.some((marker) => lowered.includes(marker));
 }
 
 function findFileRecursive(rootDir: string, fileName: string): string | null {
@@ -228,65 +219,6 @@ function findFileRecursive(rootDir: string, fileName: string): string | null {
     }
   }
   return null;
-}
-
-function findCashFlowVarianceBundlePath(containerInput: ContainerInput): string | null {
-  const candidatePaths: string[] = [];
-  const explicitPaths = [
-    containerInput.reportBundlePath,
-    containerInput.reportBundleLocalPath,
-  ];
-  for (const value of explicitPaths) {
-    if (typeof value !== 'string' || !value.trim()) {
-      continue;
-    }
-    const trimmed = value.trim();
-    candidatePaths.push(path.isAbsolute(trimmed) ? trimmed : path.resolve('/workspace/group', trimmed));
-  }
-
-  const stagedFiles = Array.isArray(containerInput.stagedInputFiles) ? containerInput.stagedInputFiles : [];
-  for (const item of stagedFiles) {
-    if (!item || typeof item !== 'object') {
-      continue;
-    }
-    if (typeof item.agentPath === 'string' && item.agentPath.trim()) {
-      candidatePaths.push(path.resolve('/workspace/group', item.agentPath.trim()));
-    }
-    if (typeof item.localPath === 'string' && item.localPath.trim()) {
-      candidatePaths.push(path.resolve(item.localPath.trim()));
-    }
-    if (typeof item.name === 'string' && item.name.trim()) {
-      candidatePaths.push(path.resolve('/workspace/group/input', item.name.trim()));
-      candidatePaths.push(path.resolve('/workspace/group', item.name.trim()));
-    }
-  }
-
-  const inputFiles = Array.isArray(containerInput.inputFiles) ? containerInput.inputFiles : [];
-  for (const item of inputFiles) {
-    if (!item || typeof item !== 'object') {
-      continue;
-    }
-    if (typeof item.name === 'string' && item.name.trim()) {
-      candidatePaths.push(path.resolve('/workspace/group/input', item.name.trim()));
-    }
-    if (typeof item.uri === 'string' && item.uri.trim()) {
-      const uriName = path.basename(item.uri.trim());
-      if (uriName) {
-        candidatePaths.push(path.resolve('/workspace/group/input', uriName));
-      }
-    }
-  }
-
-  candidatePaths.push(path.resolve('/workspace/group/input', CASH_FLOW_VARIANCE_BUNDLE_NAME));
-  candidatePaths.push(path.resolve('/workspace/group', CASH_FLOW_VARIANCE_BUNDLE_NAME));
-
-  for (const candidate of candidatePaths) {
-    if (candidate && fs.existsSync(candidate)) {
-      return candidate;
-    }
-  }
-
-  return findFileRecursive('/workspace/group/input', CASH_FLOW_VARIANCE_BUNDLE_NAME) ?? findFileRecursive('/workspace/group', CASH_FLOW_VARIANCE_BUNDLE_NAME);
 }
 
 async function executePythonFile(
@@ -312,51 +244,6 @@ async function executePythonFile(
       resolve({ stdout, stderr, exitCode });
     });
   });
-}
-
-async function maybeRunDeterministicCashFlowVarianceWorkbook(
-  prompt: string,
-  containerInput: ContainerInput,
-): Promise<{ handled: boolean; resultText: string }> {
-  if (!isCashFlowVarianceTask(prompt)) {
-    return { handled: false, resultText: '' };
-  }
-
-  const bundlePath = findCashFlowVarianceBundlePath(containerInput);
-  if (!bundlePath) {
-    log('Cash flow variance bundle not found; falling back to Gemini generation.');
-    return { handled: false, resultText: '' };
-  }
-
-  const generatorScript = path.resolve('/app/scripts/cash_flow_variance_workbook.py');
-  if (!fs.existsSync(generatorScript)) {
-    throw new Error(`Cash flow variance workbook generator not found: ${generatorScript}`);
-  }
-
-  const outputPath = path.resolve('/workspace/group/output/final', CASH_FLOW_VARIANCE_OUTPUT_NAME);
-  const execution = await executePythonFile(generatorScript, [bundlePath, outputPath]);
-  const stdout = execution.stdout.trim();
-  const stderr = execution.stderr.trim();
-  if (execution.exitCode !== 0) {
-    const errorText = stderr || stdout || `Python exited with code ${execution.exitCode}`;
-    throw new Error(`Cash flow variance workbook synthesis failed: ${errorText}`);
-  }
-  if (!fs.existsSync(outputPath)) {
-    throw new Error(`Cash flow variance workbook synthesis finished without creating ${outputPath}`);
-  }
-
-  const outputSize = fs.statSync(outputPath).size;
-  log(
-    `Deterministic cash flow variance workbook generated bundle=${bundlePath} output=${outputPath} bytes=${outputSize}`,
-  );
-  if (stdout) {
-    log(`Cash flow variance generator stdout: ${stdout}`);
-  }
-  if (stderr) {
-    log(`Cash flow variance generator stderr: ${stderr}`);
-  }
-
-  return { handled: true, resultText: CASH_FLOW_VARIANCE_REPORT_TEXT };
 }
 
 function getSessionSummary(
@@ -861,7 +748,6 @@ function normalizeGeminiText(response: GeminiGenerateResponse): string {
 
 function buildGeminiSystemInstruction(containerInput: ContainerInput): string {
   const memory = buildMemoryContext(containerInput);
-  const promptLower = (containerInput.prompt || '').toLowerCase();
   const base =
     'You are NanoClaw, a coding and task assistant running inside an isolated workspace container. ' +
     'Be concise, accurate, and explicit about limitations. ' +
@@ -874,24 +760,9 @@ function buildGeminiSystemInstruction(containerInput: ContainerInput): string {
     "Do not call add_chart('waterfall') or other unsupported chart types. " +
     'If a waterfall visualization is requested, approximate it using supported chart types such as stacked bar or column charts and note the approximation in the workbook. ' +
     'Treat trial_balance as optional and untrusted: it may be missing, null, a string, or another non-dict value. Only call .get() on it after checking isinstance(trial_balance, dict).';
-  const varianceAnalysisGuidance =
-    promptLower.includes('cash flow variance analysis') || promptLower.includes('variance_analysis')
-      ? '\n\nCash flow variance analysis instructions:\n' +
-        '- Use the staged bundle as the only source of truth.\n' +
-        "- Build a processed cash flow table from bundle['datasets_by_key']['general_ledger']['response']['result']['gl'].\n" +
-        "- Treat rows with Cash Entry set to a truthy value as cash-flow rows.\n" +
-        "- Parse each GL Date into a month bucket (YYYY-MM) and aggregate monthly totals.\n" +
-        "- Compute the cash movement for each row as Credit - Debit and preserve the source account, description, AccountType, and cash-entry flag.\n" +
-        "- Classify rows using bundle['datasets_by_key']['chart_of_accounts']['response']['result'] by account name and AccountType.\n" +
-        "- Populate the Data Source sheet with the processed cash-flow rows and the COA mapping, not just notes.\n" +
-        "- Populate the Executive Summary sheet with total cash flow by activity and the monthly net cash flow trend.\n" +
-        "- Populate the Variance Analysis sheet with one row per month and columns for actual, 3-month rolling average, variance, variance %, and any outlier flag.\n" +
-        "- If trial_balance is missing or unusable, continue without it, but do not leave the report empty when GL rows exist.\n" +
-        '- Do not output placeholder text such as "No processed cash flow entries available" or "No monthly cash flow data available" when ledger rows are present.\n'
-      : '';
-  if (!memory) return `${base}${varianceAnalysisGuidance}`;
+  if (!memory) return base;
 
-  return `${base}${varianceAnalysisGuidance}\n\nUse this persistent memory context if relevant:\n\n${memory}`;
+  return `${base}\n\nUse this persistent memory context if relevant:\n\n${memory}`;
 }
 
 function extractMissingPythonModule(errorText: string): string | null {
@@ -976,12 +847,6 @@ function detectTemplateScriptMarker(scriptSource: string): string | null {
   const lowered = scriptSource.toLowerCase();
   const markers = [
     'dummy_json_content',
-    'cash_flow_actuals',
-    'cash_flow_budget',
-    'get_cash_flow',
-    'get_cash_balance',
-    'actual_cash_flow_items',
-    'budget_cash_flow_items',
     'sample dataset',
     'sample data',
     'example dataset',
@@ -1078,31 +943,17 @@ async function requestGeminiPythonCorrection(
   const lowerContext = failureContext.toLowerCase();
   if (lowerContext.includes("keyerror: 'data'") || lowerContext.includes('response[\'data\']') || lowerContext.includes('response["data"]')) {
     contextHints.push(
-      "The bundle schema for this report uses datasets_by_key['general_ledger']['response']['result']['gl'] for ledger rows and datasets_by_key['chart_of_accounts']['response']['result'] for chart-of-accounts classifications. Do not access response['data'].",
+      'Use the staged bundle schema rather than assuming response["data"]. Inspect the actual bundle keys and values before generating code.',
     );
   }
   if (lowerContext.includes("keyerror: 'account_id'") || lowerContext.includes('account_id')) {
     contextHints.push(
-      "There is no account_id column in the ledger rows. Use the Account field from general_ledger rows and join it to the chart_of_accounts dict keyed by account name.",
+      'If the data does not contain account_id, use the available account-name or equivalent fields from the staged bundle instead of inventing columns.',
     );
   }
   if (lowerContext.includes("str' object has no attribute 'get'") || lowerContext.includes('trial_balance')) {
     contextHints.push(
-      'trial_balance is optional and may not be a dict. Guard with isinstance(trial_balance, dict) before using .get(), otherwise treat it as unavailable and continue.',
-    );
-  }
-  if (lowerContext.includes('cash_flow_actuals') || lowerContext.includes('cash_flow_budget')) {
-    contextHints.push(
-      "Do not emit scaffold names such as cash_flow_actuals or cash_flow_budget. Read only the staged bundle datasets and their existing keys.",
-    );
-  }
-  if (
-    lowerContext.includes('no processed cash flow entries available') ||
-    lowerContext.includes('no monthly cash flow data available') ||
-    lowerContext.includes('variance analysis: monthly cash flow by activity')
-  ) {
-    contextHints.push(
-      'The workbook is missing derived cash-flow analysis even though the bundle contains general_ledger rows. Recompute processed cash-flow entries from general_ledger, aggregate by month and activity, and populate the summary and variance sheets.',
+      'Guard optional nested objects with isinstance checks before calling .get(). Treat missing or invalid optional sections as unavailable and continue.',
     );
   }
   if (lowerContext.includes('```python') || lowerContext.includes('leading "python" line')) {
@@ -1119,15 +970,6 @@ async function requestGeminiPythonCorrection(
       'xlsxwriter does not support a waterfall chart type. Replace it with a supported chart, such as stacked bar or column, and do not call add_chart("waterfall").',
     );
   }
-  const codeSkeleton = [
-    'Use this bundle access pattern as the starting point:',
-    'bundle = json.load(open("input/financial_cash_flow_variance_analysis_bundle.json", "r", encoding="utf-8"))',
-    'datasets = bundle["datasets_by_key"]',
-    'gl_rows = datasets["general_ledger"]["response"]["result"]["gl"]',
-    'coa_map = datasets["chart_of_accounts"]["response"]["result"]',
-    'trial_balance = datasets.get("trial_balance", {}).get("response", {}).get("result")',
-    'Then build the workbook from those objects and write it to output/final/financial_cash_flow_variance_analysis.xlsx.',
-  ].join(' ');
   const contextHintBlock = contextHints.length > 0 ? ` Additional correction hints: ${contextHints.join(' ')}` : '';
   const retryResponse = await client.models.generateContent({
     model,
@@ -1140,10 +982,8 @@ async function requestGeminiPythonCorrection(
             text:
               'The previous Python output was invalid because it used templated or synthetic content. ' +
               `Rejected context: ${failureContext}. ` +
-              'Regenerate a real script that reads the staged report bundle from input/, uses the staged data as the only source of truth, ' +
-              'does not embed dummy_json_content or sample datasets, does not invent dataset names like cash_flow_actuals, cash_flow_budget, get_cash_flow, or get_cash_balance, ' +
-              'and writes final deliverables only under output/final.' +
-              ` ${codeSkeleton}` +
+              'Regenerate a real script that reads only the staged inputs available in the workspace, uses them as the source of truth, ' +
+              'does not embed dummy_json_content or sample datasets, and writes final deliverables only under output/final.' +
               contextHintBlock +
               ' Return only Python code with no markdown fences, no prose, and no leading "python" line.',
           },
@@ -1619,28 +1459,6 @@ async function runGeminiQuery(
   const pending = drainIpcInput();
   const combinedPrompt =
     pending.length > 0 ? `${prompt}\n${pending.join('\n')}` : prompt;
-
-  const deterministicVarianceReport = await maybeRunDeterministicCashFlowVarianceWorkbook(combinedPrompt, containerInput);
-  if (deterministicVarianceReport.handled) {
-    const resultText = deterministicVarianceReport.resultText;
-    const lastAssistantUuid = `gemini-${Date.now().toString(36)}`;
-    state.history.push({ role: 'user', text: combinedPrompt });
-    state.history.push({ role: 'model', text: resultText });
-    state.lastAssistantUuid = lastAssistantUuid;
-    saveGeminiSession(effectiveSessionId, state);
-
-    writeOutput({
-      status: 'success',
-      result: resultText,
-      newSessionId: effectiveSessionId,
-    });
-
-    return {
-      newSessionId: effectiveSessionId,
-      lastAssistantUuid,
-      closedDuringQuery: false,
-    };
-  }
 
   const contents: GeminiPromptContent[] = [
     ...state.history.map((message) => ({
