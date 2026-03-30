@@ -529,30 +529,6 @@ function getGeminiApiKey(sdkEnv: Record<string, string | undefined>): string {
   return sdkEnv.GEMINI_API_KEY || sdkEnv.GOOGLE_API_KEY || '';
 }
 
-function getGeminiVertexProjectId(
-  sdkEnv: Record<string, string | undefined>,
-): string {
-  const configured =
-    sdkEnv.VERTEX_PROJECT_ID ||
-    sdkEnv.GOOGLE_CLOUD_PROJECT ||
-    sdkEnv.RUNTIME_PROJECT_ID ||
-    sdkEnv.GCP_PROJECT ||
-    sdkEnv.GCLOUD_PROJECT ||
-    'vault-249100';
-  return configured.trim();
-}
-
-function getGeminiVertexLocation(
-  sdkEnv: Record<string, string | undefined>,
-): string {
-  const configured =
-    sdkEnv.VERTEX_LOCATION ||
-    sdkEnv.GOOGLE_CLOUD_LOCATION ||
-    sdkEnv.GEMINI_LOCATION ||
-    'global';
-  return configured.trim();
-}
-
 function envEnabled(value: string | undefined): boolean {
   if (!value) return false;
   const normalized = value.trim().toLowerCase();
@@ -578,15 +554,6 @@ async function fetchMetadata(pathSuffix: string): Promise<string> {
     );
   }
   return (await res.text()).trim();
-}
-
-async function getVertexProjectId(
-  sdkEnv: Record<string, string | undefined>,
-): Promise<string> {
-  const configured =
-    sdkEnv.VERTEX_PROJECT_ID || sdkEnv.GOOGLE_CLOUD_PROJECT || '';
-  if (configured) return configured;
-  return fetchMetadata('project/project-id');
 }
 
 async function getGcpAccessToken(
@@ -626,11 +593,7 @@ function logProviderSecretPreview(
       log(`Auth debug: ${keyName} prefix=${maskedPrefix(key)}`);
       return;
     }
-    log(
-      `Auth debug: no Gemini API key present; using Vertex AI ADC fallback project=${getGeminiVertexProjectId(
-        sdkEnv,
-      )} location=${getGeminiVertexLocation(sdkEnv)}`,
-    );
+    log('Auth debug: no Gemini API key present; using Google GenAI ADC fallback');
     return;
   }
 
@@ -753,8 +716,7 @@ function buildGeminiSystemInstruction(containerInput: ContainerInput): string {
     'Be concise, accurate, and explicit about limitations. ' +
     'If a Python execution fails due to a missing module, correct the issue by installing the dependency and retrying before giving up. ' +
     'If the task involves PDFs, do not write local PDF parsing code; use Gemini-based extraction of the PDF content or structured fields instead of local read/parsing libraries. ' +
-    'Prefer the Google GenAI SDK for Gemini work. If a Gemini API key is present, use direct API mode. ' +
-    'If no API key is present, use Vertex AI with Google Application Default Credentials and do not fail solely because an API key is missing. ' +
+    'Use the Google GenAI SDK for Gemini work. If a Gemini API key is present, use direct API mode; otherwise rely on Google Application Default Credentials. ' +
     'Do not invent a local PDF parser or require a Gemini API key when ADC is available. ' +
     'When creating spreadsheets with xlsxwriter, only use chart types that xlsxwriter supports. ' +
     "Do not call add_chart('waterfall') or other unsupported chart types. " +
@@ -1473,16 +1435,8 @@ async function runGeminiQuery(
     client = new GoogleGenAI({ apiKey });
     log(`Gemini mode: Google GenAI SDK model=${model} auth=api_key`);
   } else {
-    const project = getGeminiVertexProjectId(sdkEnv);
-    const location = getGeminiVertexLocation(sdkEnv);
-    client = new GoogleGenAI({
-      vertexai: true,
-      project,
-      location,
-    });
-    log(
-      `Gemini mode: Google GenAI SDK model=${model} auth=vertex_adc project=${project} location=${location}`,
-    );
+    client = new GoogleGenAI({});
+    log(`Gemini mode: Google GenAI SDK model=${model} auth=adc`);
   }
 
   let response: unknown;
