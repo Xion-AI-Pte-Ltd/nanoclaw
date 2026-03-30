@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any
 
 import xlsxwriter
-from xlsxwriter.utility import xl_rowcol_to_cell
 
 
 OPERATING_TOKENS = [
@@ -251,10 +250,6 @@ def write_headers(ws: xlsxwriter.workbook.Worksheet, row: int, headers: list[str
         ws.write(row, col, header, header_fmt)
 
 
-def cell_ref(row: int, col: int) -> str:
-    return xl_rowcol_to_cell(row, col, row_abs=True, col_abs=True)
-
-
 def main() -> int:
     if len(sys.argv) < 3:
         raise SystemExit("Usage: cash_flow_variance_workbook.py <bundle_path> <output_path>")
@@ -451,11 +446,6 @@ def main() -> int:
         end = ""
     ws.write("A4", f"Period: {start or 'n/a'} to {end or 'n/a'}", subtitle_fmt)
 
-    data_header_row = 3
-    data_first_row = data_header_row + 1
-    data_first_excel_row = data_first_row + 1
-    data_last_excel_row = data_first_excel_row + len(processed_rows) - 1
-
     metrics = [
         ("Cash transactions processed", len(processed_rows)),
         ("Months analysed", len(months)),
@@ -465,7 +455,6 @@ def main() -> int:
         ("Investing total", round_currency(activity_totals["Investing"])),
         ("Financing total", round_currency(activity_totals["Financing"])),
     ]
-    monthly_start_row = 8 + len(metrics) + 2
     ws.write("A6", "Key Metrics", section_fmt)
     write_headers(ws, 7, ["Metric", "Value"], header_fmt)
     for idx, (label, value) in enumerate(metrics, start=8):
@@ -478,71 +467,22 @@ def main() -> int:
         else:
             ws.write(idx, 1, value)
 
-    metric_value_row = 8
-    if processed_rows:
-        ws.write_formula(
-            metric_value_row,
-            1,
-            f"=COUNTA('Data Source'!$A${data_first_excel_row}:$A${data_last_excel_row})",
-            integer_fmt,
-            len(processed_rows),
-        )
-    else:
-        ws.write_number(metric_value_row, 1, 0, integer_fmt)
-    if months:
-        ws.write_formula(
-            metric_value_row + 1,
-            1,
-            f"=COUNTA(A{monthly_start_row + 2}:A{monthly_start_row + 1 + len(months)})",
-            integer_fmt,
-            len(months),
-        )
-    else:
-        ws.write_number(metric_value_row + 1, 1, 0, integer_fmt)
+    monthly_start_row = 8 + len(metrics) + 2
     ws.write(monthly_start_row - 1, 0, "Monthly Cash Flow Trend", section_fmt)
     monthly_headers = ["Month", "Operating", "Investing", "Financing", "Net Cash Flow", "3M Rolling Avg"]
     write_headers(ws, monthly_start_row, monthly_headers, header_fmt)
     for offset, month in enumerate(months, start=monthly_start_row + 1):
         row = monthly[month]
-        summary_row_index = offset
-        month_cell = cell_ref(summary_row_index, 0)
-        operating_formula = (
-            f'=SUMIFS(\'Data Source\'!$J${data_first_excel_row}:$J${data_last_excel_row},'
-            f'\'Data Source\'!$C${data_first_excel_row}:$C${data_last_excel_row},{month_cell},'
-            f'\'Data Source\'!$K${data_first_excel_row}:$K${data_last_excel_row},"Operating")'
-        )
-        investing_formula = (
-            f'=SUMIFS(\'Data Source\'!$J${data_first_excel_row}:$J${data_last_excel_row},'
-            f'\'Data Source\'!$C${data_first_excel_row}:$C${data_last_excel_row},{month_cell},'
-            f'\'Data Source\'!$K${data_first_excel_row}:$K${data_last_excel_row},"Investing")'
-        )
-        financing_formula = (
-            f'=SUMIFS(\'Data Source\'!$J${data_first_excel_row}:$J${data_last_excel_row},'
-            f'\'Data Source\'!$C${data_first_excel_row}:$C${data_last_excel_row},{month_cell},'
-            f'\'Data Source\'!$K${data_first_excel_row}:$K${data_last_excel_row},"Financing")'
-        )
-        net_formula = (
-            f'=SUMIFS(\'Data Source\'!$J${data_first_excel_row}:$J${data_last_excel_row},'
-            f'\'Data Source\'!$C${data_first_excel_row}:$C${data_last_excel_row},{month_cell})'
-        )
-        previous_cells = [
-            cell_ref(summary_row_index - delta, 4)
-            for delta in range(1, min(3, summary_row_index - (monthly_start_row + 1)) + 1)
-        ]
-        if previous_cells:
-            rolling_formula = "=" + (previous_cells[0] if len(previous_cells) == 1 else f"AVERAGE({','.join(previous_cells)})")
-            history_values = [monthly[m]["Net Cash Flow"] for m in months[max(0, months.index(month) - 3):months.index(month)]]
-            baseline = round_currency(sum(history_values) / len(history_values)) if history_values else None
-        else:
-            rolling_formula = ""
-            baseline = None
+        history_months = months[max(0, months.index(month) - 3):months.index(month)]
+        history_values = [monthly[m]["Net Cash Flow"] for m in history_months]
+        baseline = round_currency(sum(history_values) / len(history_values)) if history_values else None
         ws.write(offset, 0, month)
-        ws.write_formula(offset, 1, operating_formula, money_fmt, round_currency(row["Operating"]))
-        ws.write_formula(offset, 2, investing_formula, money_fmt, round_currency(row["Investing"]))
-        ws.write_formula(offset, 3, financing_formula, money_fmt, round_currency(row["Financing"]))
-        ws.write_formula(offset, 4, net_formula, money_fmt, round_currency(row["Net Cash Flow"]))
+        ws.write_number(offset, 1, round_currency(row["Operating"]), money_fmt)
+        ws.write_number(offset, 2, round_currency(row["Investing"]), money_fmt)
+        ws.write_number(offset, 3, round_currency(row["Financing"]), money_fmt)
+        ws.write_number(offset, 4, round_currency(row["Net Cash Flow"]), money_fmt)
         if baseline is not None:
-            ws.write_formula(offset, 5, rolling_formula, money_fmt, baseline)
+            ws.write_number(offset, 5, baseline, money_fmt)
         else:
             ws.write_blank(offset, 5, None)
 
@@ -579,30 +519,23 @@ def main() -> int:
     variance_headers = ["Month", "Actual", "3M Rolling Avg", "Variance", "Variance %", "Outlier", "Comment"]
     write_headers(variance_ws, 3, variance_headers, header_fmt)
     for idx, row in enumerate(variance_rows, start=4):
-        summary_row_idx = monthly_start_row + 1 + (idx - 4)
-        actual_cell = cell_ref(summary_row_idx, 4)
-        rolling_cell = cell_ref(summary_row_idx, 5)
-        variance_formula = f"={cell_ref(idx, 1)}-{cell_ref(idx, 2)}"
-        variance_pct_formula = f'=IF({cell_ref(idx, 2)}=0,"",{cell_ref(idx, 3)}/{cell_ref(idx, 2)})'
-        outlier_formula = f'=IF(ABS({cell_ref(idx, 3)})>MAX(ABS({cell_ref(idx, 2)})*0.2,2000),"Yes","No")'
-        comment_formula = f'=IF({cell_ref(idx, 2)}="","Insufficient history","Historical average baseline")'
         variance_ws.write(idx, 0, row["Month"])
-        variance_ws.write_formula(idx, 1, f"='Executive Summary'!{actual_cell}", money_fmt, float(row["Actual"]))
+        variance_ws.write_number(idx, 1, float(row["Actual"]), money_fmt)
         if row["3M Rolling Avg"] is not None:
-            variance_ws.write_formula(idx, 2, f"='Executive Summary'!{rolling_cell}", money_fmt, float(row["3M Rolling Avg"]))
+            variance_ws.write_number(idx, 2, float(row["3M Rolling Avg"]), money_fmt)
         else:
             variance_ws.write_blank(idx, 2, None)
         if row["Variance"] is not None:
-            variance_ws.write_formula(idx, 3, variance_formula, money_fmt, float(row["Variance"]))
+            variance_ws.write_number(idx, 3, float(row["Variance"]), money_fmt)
         else:
             variance_ws.write_blank(idx, 3, None)
         if row["Variance %"] is not None:
-            variance_ws.write_formula(idx, 4, variance_pct_formula, pct_fmt, float(row["Variance %"]))
+            variance_ws.write_number(idx, 4, float(row["Variance %"]), pct_fmt)
         else:
             variance_ws.write_blank(idx, 4, None)
         outlier = row["Outlier"]
-        variance_ws.write_formula(idx, 5, outlier_formula, flag_yes_fmt if outlier == "Yes" else flag_no_fmt, outlier)
-        variance_ws.write_formula(idx, 6, comment_formula, note_fmt, row["Comment"])
+        variance_ws.write(idx, 5, outlier, flag_yes_fmt if outlier == "Yes" else flag_no_fmt)
+        variance_ws.write(idx, 6, row["Comment"], note_fmt)
     if variance_rows:
         variance_chart = workbook.add_chart({"type": "line"})
         variance_chart.add_series(
@@ -695,7 +628,6 @@ def main() -> int:
         "Cash-flow events are derived by grouping general_ledger entries on MatchID and selecting the cash-account side of each pair.",
         "Monthly buckets use the parsed cash-row Date and are normalized to YYYY-MM.",
         "Cash movement uses the cash-row Amount when available, falling back to Credit - Debit only when Amount is unavailable.",
-        "Key report sheets are formula-driven so totals and variances can be traced directly from the Data Source sheet.",
         "Classification uses chart_of_accounts on the counterpart account when available; otherwise activity is inferred from account name, account type, and description.",
         "The variance baseline is a trailing 3-month rolling average of monthly net cash flow.",
         "Variance is computed as actual minus the rolling average.",
