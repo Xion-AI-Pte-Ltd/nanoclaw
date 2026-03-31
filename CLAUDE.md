@@ -4,7 +4,7 @@ Personal Claude assistant. See [README.md](README.md) for philosophy and setup. 
 
 ## Quick Context
 
-Single Node.js process that connects to WhatsApp, routes messages to Claude Agent SDK running in containers (Linux VMs). Each group has isolated filesystem and memory.
+Single Node.js process that connects to WhatsApp and routes messages to the configured agent runtime in containers (Linux VMs). This fork supports Claude Agent SDK and Google Gen AI runner modes. Each group has isolated filesystem and memory.
 
 ## Key Files
 

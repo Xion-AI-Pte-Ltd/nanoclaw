@@ -225,22 +225,46 @@ Additional mounts appear at `/workspace/extra/{containerPath}` inside the contai
 
 **Mount syntax note:** Read-write mounts use `-v host:container`, but readonly mounts require `--mount "type=bind,source=...,target=...,readonly"` (the `:ro` suffix may not work on all runtimes).
 
-### Claude Authentication
+### Provider Authentication
 
-Configure authentication in a `.env` file in the project root. Two options:
+Configure authentication in a `.env` file in the project root. This fork supports both Claude and Gemini providers.
 
-**Option 1: Claude Subscription (OAuth token)**
+**Provider selection**
+```bash
+AGENT_PROVIDER=claude   # Claude Agent SDK
+# or
+AGENT_PROVIDER=gemini   # Google Gen AI SDK
+```
+
+**Claude option 1: Claude Subscription (OAuth token)**
 ```bash
 CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-...
 ```
 The token can be extracted from `~/.claude/.credentials.json` if you're logged in to Claude Code.
 
-**Option 2: Pay-per-use API Key**
+**Claude option 2: Pay-per-use API Key**
 ```bash
 ANTHROPIC_API_KEY=sk-ant-api03-...
 ```
 
-Only the authentication variables (`CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_API_KEY`) are extracted from `.env` and written to `data/env/env`, then mounted into the container at `/workspace/env-dir/env` and sourced by the entrypoint script. This ensures other environment variables in `.env` are not exposed to the agent. This workaround is needed because some container runtimes lose `-e` environment variables when using `-i` (interactive mode with piped stdin).
+**Gemini option 1: API key**
+```bash
+GEMINI_API_KEY=...
+# or
+GOOGLE_API_KEY=...
+```
+
+**Gemini option 2: ADC / metadata-based auth**
+- omit the API key
+- provide runtime auth through ADC or instance metadata
+- optional runtime hints:
+```bash
+RUNTIME_PROJECT_ID=...
+GEMINI_LOCATION=global
+GEMINI_MODEL=gemini-2.5-flash
+```
+
+Only an allowlisted set of provider/runtime variables is extracted from `.env` and passed into the container runtime. This ensures unrelated environment variables in `.env` are not exposed to the agent.
 
 ### Changing the Assistant Name
 
@@ -586,7 +610,8 @@ WhatsApp messages could contain malicious instructions attempting to manipulate 
 
 | Credential | Storage Location | Notes |
 |------------|------------------|-------|
-| Claude CLI Auth | data/sessions/{group}/.claude/ | Per-group isolation, mounted to /home/node/.claude/ |
+| Claude CLI Auth | data/sessions/{group}/.claude/ | Used in Claude mode only; mounted to /home/node/.claude/ |
+| Gemini API/Auth Hints | `.env` allowlist / runtime metadata | Used in Gemini mode only |
 | WhatsApp Session | store/auth/ | Auto-created, persists ~20 days |
 
 ### File Permissions
@@ -607,6 +632,7 @@ chmod 700 groups/
 | No response to messages | Service not running | Check `launchctl list | grep nanoclaw` |
 | "Claude Code process exited with code 1" | Container runtime failed to start | Check logs; NanoClaw auto-starts container runtime but may fail |
 | "Claude Code process exited with code 1" | Session mount path wrong | Ensure mount is to `/home/node/.claude/` not `/root/.claude/` |
+| Gemini auth failures | Missing API key / ADC | Check `AGENT_PROVIDER`, `GEMINI_API_KEY` / `GOOGLE_API_KEY`, or runtime ADC |
 | Session not continuing | Session ID not saved | Check SQLite: `sqlite3 store/messages.db "SELECT * FROM sessions"` |
 | Session not continuing | Mount path mismatch | Container user is `node` with HOME=/home/node; sessions must be at `/home/node/.claude/` |
 | "QR code expired" | WhatsApp session expired | Delete store/auth/ and restart |
