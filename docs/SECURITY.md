@@ -46,7 +46,7 @@ The main group's project root is mounted read-only. Writable paths the agent nee
 
 ### 3. Session Isolation
 
-Each group has isolated Claude sessions at `data/sessions/{group}/.claude/`:
+Each group has isolated agent sessions at `data/sessions/{group}/.claude/`:
 - Groups cannot see other groups' conversation history
 - Session data includes full message history and file contents read
 - Prevents cross-group information disclosure
@@ -66,8 +66,9 @@ Messages and task operations are verified against group identity:
 
 ### 5. Credential Handling
 
-**Mounted Credentials:**
-- Claude auth tokens (filtered from `.env`, read-only)
+**Mounted Provider Auth / Runtime Hints:**
+- Provider selection and auth/runtime hints filtered from `.env` and passed through stdin
+- This may include Claude auth, Gemini auth, and runtime project/model hints
 
 **NOT Mounted:**
 - WhatsApp session (`store/auth/`) - host only
@@ -75,12 +76,23 @@ Messages and task operations are verified against group identity:
 - Any credentials matching blocked patterns
 
 **Credential Filtering:**
-Only these environment variables are exposed to containers:
+Only a small allowlist of runtime variables is exposed to containers:
 ```typescript
-const allowedVars = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY'];
+const allowedVars = [
+  'AGENT_PROVIDER',
+  'CLAUDE_CODE_OAUTH_TOKEN',
+  'ANTHROPIC_API_KEY',
+  'ANTHROPIC_BASE_URL',
+  'ANTHROPIC_AUTH_TOKEN',
+  'GEMINI_API_KEY',
+  'GOOGLE_API_KEY',
+  'RUNTIME_PROJECT_ID',
+  'GEMINI_LOCATION',
+  'GEMINI_MODEL',
+];
 ```
 
-> **Note:** Anthropic credentials are mounted so that Claude Code can authenticate when the agent runs. However, this means the agent itself can discover these credentials via Bash or file operations. Ideally, Claude Code would authenticate without exposing credentials to the agent's execution environment, but I couldn't figure this out. **PRs welcome** if you have ideas for credential isolation.
+> **Note:** Provider credentials are passed so the selected runtime can authenticate when the agent runs. The runner also strips the API-key variables from Bash subprocess environments before commands execute, but the agent process itself still has access to them. Credential isolation is still a real concern and should continue to be tightened.
 
 ## Privilege Comparison
 

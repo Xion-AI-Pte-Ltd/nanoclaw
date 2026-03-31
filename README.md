@@ -33,6 +33,20 @@ claude
 
 Then run `/setup`. Claude Code handles everything: dependencies, authentication, container setup and service configuration.
 
+## Provider Modes In This Fork
+
+This fork supports two runtime providers inside the agent runner:
+
+- `AGENT_PROVIDER=claude` for Claude Agent SDK execution
+- `AGENT_PROVIDER=gemini` for Google Gen AI SDK execution
+
+Gemini mode supports:
+- `GEMINI_API_KEY` or `GOOGLE_API_KEY`
+- ADC / metadata-based auth when no API key is present
+- optional `GEMINI_MODEL`, `RUNTIME_PROJECT_ID`, and `GEMINI_LOCATION`
+
+Vertex-specific runtime wiring has been removed from this fork. If you're running Gemini, use Google Gen AI auth rather than old Vertex env flags.
+
 ## Philosophy
 
 **Small enough to understand.** One process, a few source files and no microservices. If you want to understand the full NanoClaw codebase, just ask Claude Code to walk you through it.
