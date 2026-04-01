@@ -45,7 +45,8 @@ Gemini mode supports:
 - Vertex ADC auth when `RUNTIME_PROJECT_ID` is present, using `GEMINI_LOCATION` or `GOOGLE_CLOUD_LOCATION`
 - fallback ADC / metadata-based auth when no API key is present and no Vertex project is configured
 - optional `GEMINI_MODEL`, `RUNTIME_PROJECT_ID`, and `GEMINI_LOCATION`
-- spreadsheet-parse fallback diagnosis by sending staged spreadsheet files to Gemini on parse-related runtime failures before retrying code generation
+- spreadsheet-parse fallback diagnosis by inspecting staged workbooks locally, sending Gemini a structured workbook snapshot, and feeding that diagnosis into the next code-generation retry
+- retained artifact validation for `output/retained-scripts`, including manifest checks and `py_compile` validation for generated Python scripts before accepting them
 
 Gemini mode prefers Google GenAI Vertex initialization when a runtime project is configured, instead of relying on broad ADC defaults.
 
