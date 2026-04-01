@@ -17,7 +17,10 @@
 import fs from 'fs';
 import path from 'path';
 import { spawn, spawnSync } from 'child_process';
-import { GoogleGenAI } from '@google/genai';
+import {
+  GoogleGenAI,
+  createPartFromText,
+} from '@google/genai';
 import {
   query,
   HookCallback,
@@ -87,6 +90,17 @@ interface QueryResult {
 interface ExecutedGeminiResult {
   handled: boolean;
   resultText: string;
+}
+
+interface SpreadsheetDiagnosis {
+  selectedFile?: string;
+  selectedSheet?: string;
+  headerRow?: number;
+  likelyHeaders?: string[];
+  parseStrategy?: string;
+  validationChecks?: string[];
+  warnings?: string[];
+  raw?: Record<string, unknown>;
 }
 
 class GeminiTemplateScriptError extends Error {
@@ -529,6 +543,27 @@ function getGeminiApiKey(sdkEnv: Record<string, string | undefined>): string {
   return sdkEnv.GEMINI_API_KEY || sdkEnv.GOOGLE_API_KEY || '';
 }
 
+function getGeminiVertexProject(
+  sdkEnv: Record<string, string | undefined>,
+): string {
+  return (
+    sdkEnv.RUNTIME_PROJECT_ID ||
+    sdkEnv.GOOGLE_CLOUD_PROJECT ||
+    sdkEnv.GCLOUD_PROJECT ||
+    ''
+  ).trim();
+}
+
+function getGeminiVertexLocation(
+  sdkEnv: Record<string, string | undefined>,
+): string {
+  return (
+    sdkEnv.GEMINI_LOCATION ||
+    sdkEnv.GOOGLE_CLOUD_LOCATION ||
+    'global'
+  ).trim();
+}
+
 function envEnabled(value: string | undefined): boolean {
   if (!value) return false;
   const normalized = value.trim().toLowerCase();
@@ -758,6 +793,30 @@ function sanitizeGeminiPythonScript(scriptSource: string): {
   let sanitized = scriptSource;
   const notes: string[] = [];
 
+  const originalLines = sanitized.split(/\r?\n/);
+  const filteredLines: string[] = [];
+  let removedNotebookMagics = false;
+  for (const line of originalLines) {
+    const trimmed = line.trim();
+    if (
+      trimmed.startsWith('%') ||
+      trimmed.startsWith('!pip ') ||
+      trimmed.startsWith('!python ') ||
+      trimmed.startsWith('pip install ') ||
+      trimmed.startsWith('python -m pip ')
+    ) {
+      removedNotebookMagics = true;
+      continue;
+    }
+    filteredLines.push(line);
+  }
+  if (removedNotebookMagics) {
+    sanitized = filteredLines.join('\n');
+    notes.push(
+      'Removed notebook-style magic or package-install lines before execution.',
+    );
+  }
+
   if (/\btrial_balance\.get\(/.test(sanitized)) {
     sanitized = sanitized.replace(
       /\btrial_balance\.get\(/g,
@@ -855,6 +914,275 @@ function extractLastJsonObject(text: string): Record<string, unknown> | null {
   return null;
 }
 
+function isSpreadsheetCandidate(filePath: string): boolean {
+  const lower = filePath.toLowerCase();
+  return lower.endsWith('.xlsx') || lower.endsWith('.xls') || lower.endsWith('.csv');
+}
+
+function scoreSpreadsheetCandidate(filePath: string): number {
+  const lower = filePath.toLowerCase();
+  let score = 0;
+  if (lower.endsWith('.xlsx')) score += 30;
+  if (lower.endsWith('.xls')) score += 20;
+  if (lower.endsWith('.csv')) score += 10;
+  if (lower.includes('normalized')) score -= 20;
+  if (lower.includes('/input/')) score += 5;
+  return score;
+}
+
+function collectSpreadsheetCandidates(containerInput: ContainerInput): string[] {
+  const candidates = new Set<string>();
+  const inputDir = '/workspace/group/input';
+  if (fs.existsSync(inputDir)) {
+    for (const entry of fs.readdirSync(inputDir)) {
+      const fullPath = path.join(inputDir, entry);
+      if (!fs.statSync(fullPath).isFile()) continue;
+      if (isSpreadsheetCandidate(fullPath)) {
+        candidates.add(fullPath);
+      }
+    }
+  }
+
+  for (const item of containerInput.stagedInputFiles || []) {
+    for (const raw of [item.localPath, item.agentPath]) {
+      if (!raw) continue;
+      const fullPath = raw.startsWith('/') ? raw : path.join('/workspace/group', raw);
+      if (fs.existsSync(fullPath) && fs.statSync(fullPath).isFile() && isSpreadsheetCandidate(fullPath)) {
+        candidates.add(fullPath);
+      }
+    }
+  }
+
+  return Array.from(candidates).sort((a, b) => scoreSpreadsheetCandidate(b) - scoreSpreadsheetCandidate(a));
+}
+
+function shouldDiagnoseSpreadsheet(errorText: string): boolean {
+  const lower = errorText.toLowerCase();
+  const signals = [
+    'missing required columns',
+    'required column',
+    'could not find the expected header row',
+    'could not find expected header row',
+    'header row',
+    'worksheet',
+    'sheet',
+    'column',
+    'columns',
+    'keyerror',
+    'matchid',
+  ];
+  return signals.some((signal) => lower.includes(signal));
+}
+
+function looksLikeSpreadsheetPath(pathText: string): boolean {
+  const lower = pathText.toLowerCase();
+  return lower.endsWith('.xlsx') || lower.endsWith('.xls') || lower.endsWith('.csv');
+}
+
+function buildSpreadsheetDiagnosisSummary(diagnosis: SpreadsheetDiagnosis): string {
+  const lines: string[] = [];
+  if (diagnosis.selectedFile) {
+    lines.push(`Gemini spreadsheet diagnosis file: ${diagnosis.selectedFile}`);
+  }
+  if (diagnosis.selectedSheet) {
+    lines.push(`Gemini spreadsheet diagnosis sheet: ${diagnosis.selectedSheet}`);
+  }
+  if (typeof diagnosis.headerRow === 'number') {
+    lines.push(`Gemini spreadsheet diagnosis header row (1-based): ${diagnosis.headerRow}`);
+  }
+  if (diagnosis.likelyHeaders && diagnosis.likelyHeaders.length > 0) {
+    lines.push(`Gemini likely headers: ${diagnosis.likelyHeaders.join(', ')}`);
+  }
+  if (diagnosis.parseStrategy) {
+    lines.push(`Gemini parse strategy: ${diagnosis.parseStrategy}`);
+  }
+  if (diagnosis.validationChecks && diagnosis.validationChecks.length > 0) {
+    lines.push(`Gemini validation checks: ${diagnosis.validationChecks.join(' | ')}`);
+  }
+  if (diagnosis.warnings && diagnosis.warnings.length > 0) {
+    lines.push(`Gemini warnings: ${diagnosis.warnings.join(' | ')}`);
+  }
+  return lines.join('\n');
+}
+
+function buildSpreadsheetInspectionSnapshot(filePath: string): string {
+  const lower = filePath.toLowerCase();
+  if (lower.endsWith('.csv')) {
+    try {
+      const preview = fs.readFileSync(filePath, 'utf-8').split(/\r?\n/).slice(0, 25).join('\n');
+      return JSON.stringify(
+        {
+          kind: 'csv_preview',
+          file: path.basename(filePath),
+          preview,
+        },
+        null,
+        2,
+      );
+    } catch (error) {
+      return JSON.stringify(
+        {
+          kind: 'csv_preview',
+          file: path.basename(filePath),
+          error: error instanceof Error ? error.message : String(error),
+        },
+        null,
+        2,
+      );
+    }
+  }
+
+  const pyScript = `
+import json
+import sys
+from openpyxl import load_workbook
+
+def normalize(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float, bool)):
+        return value
+    return str(value)
+
+file_path = sys.argv[1]
+wb = load_workbook(file_path, read_only=True, data_only=False)
+payload = {
+    "kind": "xlsx_preview",
+    "file": file_path.split("/")[-1],
+    "sheets": [],
+}
+
+for ws in wb.worksheets[:8]:
+    rows = []
+    for idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
+        values = [normalize(cell) for cell in row]
+        if any(value not in (None, "") for value in values):
+            rows.append({"rowNumber": idx, "values": values[:30]})
+        if len(rows) >= 20:
+            break
+    payload["sheets"].append({
+        "sheetName": ws.title,
+        "previewRows": rows,
+    })
+
+print(json.dumps(payload))
+`.trim();
+
+  const probe = spawnSync('python3', ['-c', pyScript, filePath], {
+    cwd: '/workspace/group',
+    env: process.env,
+    encoding: 'utf-8',
+  });
+  if (probe.status === 0 && probe.stdout.trim()) {
+    return probe.stdout.trim();
+  }
+  return JSON.stringify(
+    {
+      kind: 'xlsx_preview',
+      file: path.basename(filePath),
+      error: (probe.stderr || probe.stdout || `python exited with ${probe.status}`).trim(),
+    },
+    null,
+    2,
+  );
+}
+
+async function diagnoseSpreadsheetWithGemini(
+  client: GoogleGenAI,
+  model: string,
+  containerInput: ContainerInput,
+  failureContext: string,
+): Promise<SpreadsheetDiagnosis | null> {
+  const candidates = collectSpreadsheetCandidates(containerInput).filter((candidate) =>
+    !candidate.toLowerCase().includes('normalized'),
+  );
+  const selectedFile = candidates[0] || collectSpreadsheetCandidates(containerInput)[0];
+  if (!selectedFile) {
+    log('Spreadsheet diagnosis skipped: no staged spreadsheet candidate found');
+    return null;
+  }
+
+  const promptParts = [
+    createPartFromText(
+      'You are diagnosing a spreadsheet parsing failure for a code-generation loop. ' +
+        'Inspect the provided workbook snapshot and return JSON only. ' +
+        'Identify the most likely sheet to parse, the 1-based header row number, the likely headers, ' +
+        'a concise parse strategy, validation checks, and warnings. ' +
+        'Do not return code. Do not wrap the JSON in markdown.',
+    ),
+    createPartFromText(`Runtime failure context: ${failureContext}`),
+  ];
+
+  promptParts.push(
+    createPartFromText(
+      `Workbook inspection snapshot:\n${buildSpreadsheetInspectionSnapshot(selectedFile)}`,
+    ),
+  );
+  promptParts.push(
+    createPartFromText(
+      JSON.stringify({
+        requested_schema: {
+          selectedFile: path.basename(selectedFile),
+          selectedSheet: 'string or null',
+          headerRow: 'number or null',
+          likelyHeaders: ['string'],
+          parseStrategy: 'string',
+          validationChecks: ['string'],
+          warnings: ['string'],
+        },
+      }),
+    ),
+  );
+
+  try {
+    const response = await client.models.generateContent({
+      model,
+      contents: promptParts,
+    });
+    const sdkText =
+      response && typeof response === 'object' && 'text' in response
+        ? String((response as { text?: unknown }).text || '').trim()
+        : '';
+    const responseText = sdkText || normalizeGeminiText(response as GeminiGenerateResponse);
+    if (!responseText) {
+      log('Spreadsheet diagnosis returned no text');
+      return null;
+    }
+    const parsed = extractLastJsonObject(responseText);
+    if (!parsed) {
+      log(`Spreadsheet diagnosis returned non-JSON text: ${responseText.slice(0, 500)}`);
+      return null;
+    }
+    const diagnosis: SpreadsheetDiagnosis = {
+      selectedFile:
+        typeof parsed.selectedFile === 'string' && looksLikeSpreadsheetPath(parsed.selectedFile)
+          ? parsed.selectedFile
+          : path.basename(selectedFile),
+      selectedSheet: typeof parsed.selectedSheet === 'string' ? parsed.selectedSheet : undefined,
+      headerRow: typeof parsed.headerRow === 'number' ? parsed.headerRow : undefined,
+      likelyHeaders: Array.isArray(parsed.likelyHeaders)
+        ? parsed.likelyHeaders.filter((value): value is string => typeof value === 'string')
+        : undefined,
+      parseStrategy: typeof parsed.parseStrategy === 'string' ? parsed.parseStrategy : undefined,
+      validationChecks: Array.isArray(parsed.validationChecks)
+        ? parsed.validationChecks.filter((value): value is string => typeof value === 'string')
+        : undefined,
+      warnings: Array.isArray(parsed.warnings)
+        ? parsed.warnings.filter((value): value is string => typeof value === 'string')
+        : undefined,
+      raw: parsed,
+    };
+    return diagnosis;
+  } catch (error) {
+    log(
+      `Spreadsheet diagnosis request failed: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+    return null;
+  }
+}
+
 async function executePythonScript(
   scriptSource: string,
   allowDependencyRepair = true,
@@ -900,6 +1228,7 @@ async function requestGeminiPythonCorrection(
   contents: GeminiPromptContent[],
   systemInstruction: string,
   failureContext: string,
+  diagnosisSummary?: string,
 ): Promise<string> {
   const contextHints: string[] = [];
   const lowerContext = failureContext.toLowerCase();
@@ -924,12 +1253,35 @@ async function requestGeminiPythonCorrection(
     );
   }
   if (
+    lowerContext.includes('%pip') ||
+    lowerContext.includes('pip install') ||
+    lowerContext.includes('syntaxerror: invalid syntax')
+  ) {
+    contextHints.push(
+      'Do not emit notebook magics, shell commands, or pip install lines. Return executable Python only.',
+    );
+  }
+  if (
+    lowerContext.includes('retained artifact validation failed') ||
+    lowerContext.includes('invalid format specifier') ||
+    lowerContext.includes('py_compile')
+  ) {
+    contextHints.push(
+      'When writing retained Python scripts, do not generate them through f-strings that interpolate nested code blocks. Write plain file content so the retained script itself is valid Python and py_compile clean.',
+    );
+  }
+  if (
     lowerContext.includes("unknown chart type 'waterfall'") ||
     lowerContext.includes("chart.add_series(") ||
     lowerContext.includes("add_chart('waterfall')")
   ) {
     contextHints.push(
       'xlsxwriter does not support a waterfall chart type. Replace it with a supported chart, such as stacked bar or column, and do not call add_chart("waterfall").',
+    );
+  }
+  if (diagnosisSummary) {
+    contextHints.push(
+      `Use this spreadsheet diagnosis to guide the retry: ${diagnosisSummary}`,
     );
   }
   const contextHintBlock = contextHints.length > 0 ? ` Additional correction hints: ${contextHints.join(' ')}` : '';
@@ -1074,12 +1426,61 @@ async function ensurePythonDependencies(scriptSource: string): Promise<void> {
   }
 }
 
+function findRetainedArtifactValidationError(): string | null {
+  const retainedDir = '/workspace/group/output/retained-scripts';
+  if (!fs.existsSync(retainedDir)) {
+    return null;
+  }
+
+  const manifestPath = path.join(retainedDir, 'manifest.json');
+  if (fs.existsSync(manifestPath)) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(manifestPath, 'utf-8')) as {
+        scripts?: Array<{ name?: unknown; description?: unknown }>;
+      };
+      if (!Array.isArray(parsed.scripts)) {
+        return 'Retained artifact validation failed: manifest.json is missing a scripts array.';
+      }
+      for (const item of parsed.scripts) {
+        if (
+          !item ||
+          typeof item.name !== 'string' ||
+          !item.name.trim() ||
+          typeof item.description !== 'string' ||
+          !item.description.trim()
+        ) {
+          return 'Retained artifact validation failed: manifest.json contains an invalid script entry.';
+        }
+      }
+    } catch (error) {
+      return `Retained artifact validation failed: manifest.json is invalid JSON (${error instanceof Error ? error.message : String(error)}).`;
+    }
+  }
+
+  for (const entry of fs.readdirSync(retainedDir)) {
+    if (!entry.endsWith('.py')) continue;
+    const fullPath = path.join(retainedDir, entry);
+    const probe = spawnSync('python3', ['-m', 'py_compile', fullPath], {
+      cwd: '/workspace/group',
+      env: process.env,
+      encoding: 'utf-8',
+    });
+    if (probe.status !== 0) {
+      const detail = (probe.stderr || probe.stdout || `py_compile exited with ${probe.status}`).trim();
+      return `Retained artifact validation failed for ${entry}: ${detail}`;
+    }
+  }
+
+  return null;
+}
+
 async function maybeExecuteGeminiCodeResult(
   textResult: string,
   client: GoogleGenAI,
   model: string,
   contents: GeminiPromptContent[],
   systemInstruction: string,
+  containerInput: ContainerInput,
 ): Promise<ExecutedGeminiResult> {
   const normalizedTextResult = normalizePythonScriptText(textResult);
   const pythonBlock = extractFencedBlock(textResult, 'python') || normalizedTextResult;
@@ -1144,8 +1545,29 @@ async function maybeExecuteGeminiCodeResult(
       };
     }
 
+    let diagnosisSummary = '';
+    if (shouldDiagnoseSpreadsheet(errorText)) {
+      const diagnosis = await diagnoseSpreadsheetWithGemini(
+        client,
+        model,
+        containerInput,
+        errorText,
+      );
+      if (diagnosis) {
+        diagnosisSummary = buildSpreadsheetDiagnosisSummary(diagnosis);
+        log(`Spreadsheet diagnosis acquired for retry: ${diagnosisSummary}`);
+      }
+    }
+
     log(`Gemini Python failed at runtime; requesting corrected script once. Error: ${errorText}`);
-    const correctedScript = await requestGeminiPythonCorrection(client, model, contents, systemInstruction, errorText);
+    const correctedScript = await requestGeminiPythonCorrection(
+      client,
+      model,
+      contents,
+      systemInstruction,
+      errorText,
+      diagnosisSummary,
+    );
     const normalizedCorrectedScript = normalizePythonScriptText(correctedScript);
     const correctedTemplateMarker = detectTemplateScriptMarker(normalizedCorrectedScript);
     if (correctedTemplateMarker) {
@@ -1189,7 +1611,66 @@ async function maybeExecuteGeminiCodeResult(
         handled: true,
         resultText: correctedStdout || textResult,
       };
+  }
+
+  const retainedArtifactError = findRetainedArtifactValidationError();
+  if (retainedArtifactError) {
+    log(`Gemini retained artifact validation failed; requesting corrected script once. Error: ${retainedArtifactError}`);
+    const correctedScript = await requestGeminiPythonCorrection(
+      client,
+      model,
+      contents,
+      systemInstruction,
+      retainedArtifactError,
+    );
+    const normalizedCorrectedScript = normalizePythonScriptText(correctedScript);
+    const correctedTemplateMarker = detectTemplateScriptMarker(normalizedCorrectedScript);
+    if (correctedTemplateMarker) {
+      throw new GeminiTemplateScriptError(correctedTemplateMarker);
     }
+    const sanitizedCorrected = sanitizeGeminiPythonScript(normalizedCorrectedScript);
+    if (sanitizedCorrected.notes.length > 0) {
+      log(`Corrected Gemini script sanitized before execution: ${sanitizedCorrected.notes.join(' | ')}`);
+    }
+    await ensurePythonDependencies(sanitizedCorrected.script);
+    const correctedExecution = await executePythonScript(sanitizedCorrected.script, false);
+    const correctedStdout = correctedExecution.stdout.trim();
+    const correctedStderr = correctedExecution.stderr.trim();
+    if (correctedExecution.exitCode !== 0) {
+      const correctedErrorText =
+        correctedStderr || correctedStdout || `Python exited with code ${correctedExecution.exitCode}`;
+      throw new Error(`Gemini-generated Python failed: ${correctedErrorText}`);
+    }
+    const postCorrectionRetainedArtifactError = findRetainedArtifactValidationError();
+    if (postCorrectionRetainedArtifactError) {
+      throw new Error(postCorrectionRetainedArtifactError);
+    }
+    const correctedParsedJson = extractLastJsonObject(correctedStdout);
+    if (correctedParsedJson) {
+      return {
+        handled: true,
+        resultText: JSON.stringify(correctedParsedJson),
+      };
+    }
+    const correctedOutputFiles = Array.from(
+      correctedStdout.matchAll(/output\/final\/[^\s"'`]+/g),
+      (match) => match[0],
+    );
+    if (correctedOutputFiles.length > 0) {
+      return {
+        handled: true,
+        resultText: JSON.stringify({
+          confidence: 1.0,
+          output_files: correctedOutputFiles,
+          stdout: correctedStdout.slice(0, 2000),
+        }),
+      };
+    }
+    return {
+      handled: true,
+      resultText: correctedStdout || textResult,
+    };
+  }
 
   const parsedJson = extractLastJsonObject(stdout);
   if (parsedJson) {
@@ -1435,8 +1916,21 @@ async function runGeminiQuery(
     client = new GoogleGenAI({ apiKey });
     log(`Gemini mode: Google GenAI SDK model=${model} auth=api_key`);
   } else {
-    client = new GoogleGenAI({});
-    log(`Gemini mode: Google GenAI SDK model=${model} auth=adc`);
+    const project = getGeminiVertexProject(sdkEnv);
+    const location = getGeminiVertexLocation(sdkEnv);
+    if (project) {
+      client = new GoogleGenAI({
+        vertexai: true,
+        project,
+        location,
+      });
+      log(
+        `Gemini mode: Google GenAI SDK model=${model} auth=vertex_adc project=${project} location=${location}`,
+      );
+    } else {
+      client = new GoogleGenAI({});
+      log(`Gemini mode: Google GenAI SDK model=${model} auth=adc`);
+    }
   }
 
   let response: unknown;
@@ -1466,7 +1960,14 @@ async function runGeminiQuery(
   let executed: ExecutedGeminiResult | null = null;
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
-      executed = await maybeExecuteGeminiCodeResult(textResult, client, model, contents, systemInstruction);
+      executed = await maybeExecuteGeminiCodeResult(
+        textResult,
+        client,
+        model,
+        contents,
+        systemInstruction,
+        containerInput,
+      );
       if (executed.handled) {
         textResult = executed.resultText;
       }
@@ -1474,7 +1975,13 @@ async function runGeminiQuery(
     } catch (error) {
       if (error instanceof GeminiTemplateScriptError && attempt === 0) {
         log(`Gemini Python looked templated (${error.marker}); requesting a corrected script once.`);
-        textResult = await requestGeminiPythonCorrection(client, model, contents, systemInstruction, error.marker);
+        textResult = await requestGeminiPythonCorrection(
+          client,
+          model,
+          contents,
+          systemInstruction,
+          error.marker,
+        );
         if (!textResult) {
           throw new Error('Gemini correction retry returned no text output');
         }

@@ -42,10 +42,12 @@ This fork supports two runtime providers inside the agent runner:
 
 Gemini mode supports:
 - `GEMINI_API_KEY` or `GOOGLE_API_KEY`
-- ADC / metadata-based auth when no API key is present
+- Vertex ADC auth when `RUNTIME_PROJECT_ID` is present, using `GEMINI_LOCATION` or `GOOGLE_CLOUD_LOCATION`
+- fallback ADC / metadata-based auth when no API key is present and no Vertex project is configured
 - optional `GEMINI_MODEL`, `RUNTIME_PROJECT_ID`, and `GEMINI_LOCATION`
+- spreadsheet-parse fallback diagnosis by sending staged spreadsheet files to Gemini on parse-related runtime failures before retrying code generation
 
-Vertex-specific runtime wiring has been removed from this fork. If you're running Gemini, use Google Gen AI auth rather than old Vertex env flags.
+Gemini mode prefers Google GenAI Vertex initialization when a runtime project is configured, instead of relying on broad ADC defaults.
 
 ## Philosophy
 
