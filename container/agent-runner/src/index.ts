@@ -1895,7 +1895,7 @@ async function runGeminiQuery(
 
   const apiKey = getGeminiApiKey(sdkEnv);
 
-  const model = sdkEnv.GEMINI_MODEL || 'gemini-2.0-flash';
+  const model = sdkEnv.GEMINI_MODEL || 'gemini-3-flash-preview';
   const { sessionId: effectiveSessionId, state } = loadGeminiSession(sessionId);
   const systemInstruction = buildGeminiSystemInstruction(containerInput);
 
