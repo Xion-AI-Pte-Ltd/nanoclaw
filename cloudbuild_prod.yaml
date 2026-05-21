@@ -1,0 +1,37 @@
+substitutions:
+  _REGION: asia-east2
+  _AR_REPO: marathon
+  _IMAGE_NAME: nanoclaw-agent
+  _IMAGE_TAG: latest
+
+steps:
+  - name: gcr.io/cloud-builders/docker
+    id: build-nanoclaw-agent
+    args:
+      - build
+      - -f
+      - container/Dockerfile
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_IMAGE_NAME}:${_IMAGE_TAG}
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_IMAGE_NAME}:${_IMAGE_TAG}-$SHORT_SHA
+      - ./container
+
+  - name: gcr.io/cloud-builders/docker
+    id: push-nanoclaw-agent-latest
+    args:
+      - push
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_IMAGE_NAME}:${_IMAGE_TAG}
+
+  - name: gcr.io/cloud-builders/docker
+    id: push-nanoclaw-agent-sha
+    args:
+      - push
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_IMAGE_NAME}:${_IMAGE_TAG}-$SHORT_SHA
+
+images:
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_IMAGE_NAME}:${_IMAGE_TAG}
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/${_IMAGE_NAME}:${_IMAGE_TAG}-$SHORT_SHA
+
+options:
+  logging: CLOUD_LOGGING_ONLY
