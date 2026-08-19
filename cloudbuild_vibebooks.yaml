@@ -1,0 +1,57 @@
+# Cloud Build configuration for the NanoClaw agent used by Vibo Marathon.
+# Intended trigger: pushes to the vibebooks branch in project vibo-502301.
+
+substitutions:
+  _TARGET_PROJECT: vibo-502301
+  _REGION: us-central1
+  _AR_REPO: docker-images
+  _IMAGE_NAME: nanoclaw-agent
+
+steps:
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    id: validate-vibo-target
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        test "$PROJECT_ID" = "${_TARGET_PROJECT}"
+        test -n "$SHORT_SHA"
+        gcloud artifacts repositories describe "${_AR_REPO}" \
+          --location="${_REGION}" \
+          --project="${_TARGET_PROJECT}" >/dev/null
+
+  - name: gcr.io/cloud-builders/docker
+    id: build-nanoclaw-agent
+    args:
+      - build
+      - -f
+      - container/Dockerfile
+      - -t
+      - ${_REGION}-docker.pkg.dev/${_TARGET_PROJECT}/${_AR_REPO}/${_IMAGE_NAME}:vibebooks
+      - -t
+      - ${_REGION}-docker.pkg.dev/${_TARGET_PROJECT}/${_AR_REPO}/${_IMAGE_NAME}:vibebooks-$SHORT_SHA
+      - ./container
+
+  - name: gcr.io/cloud-builders/docker
+    id: push-nanoclaw-agent-branch
+    args:
+      - push
+      - ${_REGION}-docker.pkg.dev/${_TARGET_PROJECT}/${_AR_REPO}/${_IMAGE_NAME}:vibebooks
+
+  - name: gcr.io/cloud-builders/docker
+    id: push-nanoclaw-agent-sha
+    args:
+      - push
+      - ${_REGION}-docker.pkg.dev/${_TARGET_PROJECT}/${_AR_REPO}/${_IMAGE_NAME}:vibebooks-$SHORT_SHA
+
+images:
+  - ${_REGION}-docker.pkg.dev/${_TARGET_PROJECT}/${_AR_REPO}/${_IMAGE_NAME}:vibebooks
+  - ${_REGION}-docker.pkg.dev/${_TARGET_PROJECT}/${_AR_REPO}/${_IMAGE_NAME}:vibebooks-$SHORT_SHA
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+tags:
+  - nanoclaw-agent
+  - vibebooks
