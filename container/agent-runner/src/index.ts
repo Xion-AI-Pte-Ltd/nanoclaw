@@ -15,6 +15,7 @@
  */
 
 import fs from 'fs';
+import { generationConfig, emptyResponseReason } from './gemini-generation.js';
 import path from 'path';
 import { spawn, spawnSync } from 'child_process';
 import {
@@ -1304,9 +1305,7 @@ async function requestGeminiPythonCorrection(
         ],
       },
     ],
-    config: {
-      systemInstruction,
-    },
+    config: generationConfig(systemInstruction),
   });
 
   const retrySdkText =
@@ -1938,9 +1937,7 @@ async function runGeminiQuery(
     response = await client.models.generateContent({
       model,
       contents,
-      config: {
-        systemInstruction,
-      },
+      config: generationConfig(systemInstruction),
     });
   } catch (error) {
     const msg =
@@ -1954,7 +1951,7 @@ async function runGeminiQuery(
       : '';
   let textResult = sdkText || normalizeGeminiText(response as GeminiGenerateResponse);
   if (!textResult) {
-    throw new Error('Gemini returned no text output');
+    throw new Error(`Gemini returned no text output: ${emptyResponseReason(response)}`);
   }
 
   let executed: ExecutedGeminiResult | null = null;
