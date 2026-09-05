@@ -15,7 +15,7 @@
  */
 
 import fs from 'fs';
-import { generationConfig, emptyResponseReason } from './gemini-generation.js';
+import { generationConfig, emptyResponseReason, decodeGenerationText } from './gemini-generation.js';
 import path from 'path';
 import { spawn, spawnSync } from 'child_process';
 import {
@@ -1305,14 +1305,16 @@ async function requestGeminiPythonCorrection(
         ],
       },
     ],
-    config: generationConfig(systemInstruction),
+    config: generationConfig(systemInstruction, true),
   });
 
   const retrySdkText =
     retryResponse && typeof retryResponse === 'object' && 'text' in retryResponse
       ? String((retryResponse as { text?: unknown }).text || '').trim()
       : '';
-  return normalizePythonScriptText(retrySdkText || normalizeGeminiText(retryResponse as GeminiGenerateResponse));
+  return normalizePythonScriptText(decodeGenerationText(
+    retrySdkText || normalizeGeminiText(retryResponse as GeminiGenerateResponse), true,
+  ));
 }
 
 async function installPythonPackage(packageName: string): Promise<void> {
@@ -1897,6 +1899,7 @@ async function runGeminiQuery(
   const model = sdkEnv.GEMINI_MODEL || 'gemini-3-flash-preview';
   const { sessionId: effectiveSessionId, state } = loadGeminiSession(sessionId);
   const systemInstruction = buildGeminiSystemInstruction(containerInput);
+  const structuredAnswer = containerInput.groupFolder === 'marathon';
 
   const pending = drainIpcInput();
   const combinedPrompt =
@@ -1922,6 +1925,7 @@ async function runGeminiQuery(
         vertexai: true,
         project,
         location,
+        httpOptions: { apiVersion: 'v1' },
       });
       log(
         `Gemini mode: Google GenAI SDK model=${model} auth=vertex_adc project=${project} location=${location}`,
@@ -1937,7 +1941,7 @@ async function runGeminiQuery(
     response = await client.models.generateContent({
       model,
       contents,
-      config: generationConfig(systemInstruction),
+      config: generationConfig(systemInstruction, structuredAnswer),
     });
   } catch (error) {
     const msg =
@@ -1953,6 +1957,7 @@ async function runGeminiQuery(
   if (!textResult) {
     throw new Error(`Gemini returned no text output: ${emptyResponseReason(response)}`);
   }
+  textResult = decodeGenerationText(textResult, structuredAnswer);
 
   let executed: ExecutedGeminiResult | null = null;
   for (let attempt = 0; attempt < 2; attempt += 1) {
