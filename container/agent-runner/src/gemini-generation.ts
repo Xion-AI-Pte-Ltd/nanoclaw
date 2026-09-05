@@ -1,6 +1,14 @@
+import { FunctionCallingConfigMode } from '@google/genai';
+
 /** Leave room for both reasoning and the generated runnable program. */
 export function generationConfig(systemInstruction: string) {
-  return { systemInstruction, maxOutputTokens: 16384 };
+  return {
+    systemInstruction: systemInstruction + '\nNo function-calling tools are registered for this provider. '
+      + 'Respond with text. For code execution return one fenced runnable Python program; '
+      + 'the runner executes it after your reply. Never emit a tool or function call.',
+    maxOutputTokens: 16384,
+    toolConfig: { functionCallingConfig: { mode: FunctionCallingConfigMode.NONE } },
+  };
 }
 
 export function emptyResponseReason(response: unknown): string {
