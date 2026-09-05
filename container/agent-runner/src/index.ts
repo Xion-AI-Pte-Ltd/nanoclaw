@@ -1560,58 +1560,56 @@ async function maybeExecuteGeminiCodeResult(
       }
     }
 
-    log(`Gemini Python failed at runtime; requesting corrected script once. Error: ${errorText}`);
-    const correctedScript = await requestGeminiPythonCorrection(
-      client,
-      model,
-      contents,
-      systemInstruction,
-      errorText,
-      diagnosisSummary,
-    );
-    const normalizedCorrectedScript = normalizePythonScriptText(correctedScript);
-    const correctedTemplateMarker = detectTemplateScriptMarker(normalizedCorrectedScript);
-    if (correctedTemplateMarker) {
-      throw new GeminiTemplateScriptError(correctedTemplateMarker);
+    let correctionError = errorText;
+    for (let correctionAttempt = 1; correctionAttempt <= 3; correctionAttempt += 1) {
+      log(`Gemini Python failed at runtime; requesting corrected script (${correctionAttempt}/3). Error: ${correctionError}`);
+      const correctedScript = await requestGeminiPythonCorrection(
+        client,
+        model,
+        contents,
+        systemInstruction,
+        correctionError,
+        diagnosisSummary,
+      );
+      const normalizedCorrectedScript = normalizePythonScriptText(correctedScript);
+      const correctedTemplateMarker = detectTemplateScriptMarker(normalizedCorrectedScript);
+      if (correctedTemplateMarker) {
+        throw new GeminiTemplateScriptError(correctedTemplateMarker);
+      }
+      const sanitizedCorrected = sanitizeGeminiPythonScript(normalizedCorrectedScript);
+      if (sanitizedCorrected.notes.length > 0) {
+        log(`Corrected Gemini script sanitized before execution: ${sanitizedCorrected.notes.join(' | ')}`);
+      }
+      await ensurePythonDependencies(sanitizedCorrected.script);
+      const correctedExecution = await executePythonScript(sanitizedCorrected.script, false);
+      const correctedStdout = correctedExecution.stdout.trim();
+      const correctedStderr = correctedExecution.stderr.trim();
+      if (correctedExecution.exitCode !== 0) {
+        correctionError = correctedStderr || correctedStdout
+          || `Python exited with code ${correctedExecution.exitCode}`;
+        continue;
+      }
+      const correctedParsedJson = extractLastJsonObject(correctedStdout);
+      if (correctedParsedJson) {
+        return { handled: true, resultText: JSON.stringify(correctedParsedJson) };
+      }
+      const correctedOutputFiles = Array.from(
+        correctedStdout.matchAll(/output\/final\/[^\s"'`]+/g),
+        (match) => match[0],
+      );
+      if (correctedOutputFiles.length > 0) {
+        return {
+          handled: true,
+          resultText: JSON.stringify({
+            confidence: 1.0,
+            output_files: correctedOutputFiles,
+            stdout: correctedStdout.slice(0, 2000),
+          }),
+        };
+      }
+      return { handled: true, resultText: correctedStdout || textResult };
     }
-    const sanitizedCorrected = sanitizeGeminiPythonScript(normalizedCorrectedScript);
-    if (sanitizedCorrected.notes.length > 0) {
-      log(`Corrected Gemini script sanitized before execution: ${sanitizedCorrected.notes.join(' | ')}`);
-    }
-    await ensurePythonDependencies(sanitizedCorrected.script);
-    const correctedExecution = await executePythonScript(sanitizedCorrected.script, false);
-    const correctedStdout = correctedExecution.stdout.trim();
-    const correctedStderr = correctedExecution.stderr.trim();
-    if (correctedExecution.exitCode !== 0) {
-      const correctedErrorText =
-        correctedStderr || correctedStdout || `Python exited with code ${correctedExecution.exitCode}`;
-      throw new Error(`Gemini-generated Python failed: ${correctedErrorText}`);
-    }
-    const correctedParsedJson = extractLastJsonObject(correctedStdout);
-    if (correctedParsedJson) {
-      return {
-        handled: true,
-        resultText: JSON.stringify(correctedParsedJson),
-      };
-    }
-    const correctedOutputFiles = Array.from(
-      correctedStdout.matchAll(/output\/final\/[^\s"'`]+/g),
-      (match) => match[0],
-    );
-    if (correctedOutputFiles.length > 0) {
-      return {
-        handled: true,
-        resultText: JSON.stringify({
-          confidence: 1.0,
-          output_files: correctedOutputFiles,
-          stdout: correctedStdout.slice(0, 2000),
-        }),
-      };
-    }
-      return {
-        handled: true,
-        resultText: correctedStdout || textResult,
-      };
+    throw new Error(`Gemini-generated Python failed after 3 corrections: ${correctionError}`);
   }
 
   const retainedArtifactError = findRetainedArtifactValidationError();
