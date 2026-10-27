@@ -1,0 +1,12 @@
+# syntax=docker/dockerfile:1
+# Separate image: building this does not change the existing agent image.
+FROM python:3.12-slim
+RUN --mount=type=secret,id=pip_config,target=/etc/pip.conf,required=true \
+    pip install --no-cache-dir counto-api-client==0.1.1 \
+        'pandas>=2.2,<3' 'openpyxl>=3.1,<4' 'xlrd>=2,<3' 'xlsxwriter>=3.2,<4'
+RUN useradd --uid 1000 --create-home script && mkdir -p /workspace/group /app/script-runtime
+COPY script-runtime/ /app/script-runtime/
+ENV PYTHONPATH=/app/script-runtime PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 DEV_MODE=REMOTE
+USER script
+WORKDIR /workspace/group
+ENTRYPOINT ["python", "/app/script-runtime/run_script.py"]

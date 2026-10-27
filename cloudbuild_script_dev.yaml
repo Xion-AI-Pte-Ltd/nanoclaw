@@ -1,0 +1,22 @@
+substitutions:
+  _REGION: asia-east2
+  _AR_REPO: marathon
+  _IMAGE_TAG: approved-script-dev
+steps:
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    id: configure-private-package-index
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        TOKEN="$$(gcloud auth print-access-token)"
+        umask 077
+        printf '[global]\nextra-index-url = https://oauth2accesstoken:%s@asia-southeast1-python.pkg.dev/vault-249100/counto-api-client/simple/\n' "$${TOKEN}" > /workspace/pip.conf
+  - name: gcr.io/cloud-builders/docker
+    env: [DOCKER_BUILDKIT=1]
+    args: [build, --secret, 'id=pip_config,src=/workspace/pip.conf', -f, container/Dockerfile.script, -t, '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/nanoclaw-script:${_IMAGE_TAG}', ./container]
+images:
+  - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/nanoclaw-script:${_IMAGE_TAG}'
+options:
+  logging: CLOUD_LOGGING_ONLY
