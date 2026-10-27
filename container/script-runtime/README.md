@@ -26,3 +26,21 @@ in the explicit receipt. Never put credentials in context or receipt fields.
 `tests/test_approved_script_runtime.py` runs actual Python subprocesses, including a
 shared-client extraction/save/readback sequence against a local contract fixture.
 That test does not establish deployed service authorization or real Vault success.
+
+## Dev release
+
+Merge approved-script changes into `dev` after PR review. The existing Node CI
+also checks PRs targeting `dev`. Do not merge dev-only work into `main`: the
+existing production trigger on that branch rebuilds the agent image.
+
+Build the script image manually from the reviewed dev commit using
+`cloudbuild_script_dev.yaml`, with project `vault-dev-270023` and an explicit
+`_IMAGE_TAG=dev-<commit-sha>`. This build runs all Python runtime tests through
+the existing authenticated package index before building and publishing only
+`nanoclaw-script`. It does not build, pull or replace `nanoclaw-agent`.
+
+Configure Marathon with the resulting immutable image digest, initially leaving
+approved-script execution disabled. The existing Marathon manual dev deployment
+remains the deployment path; a separate NanoClaw deployment trigger is not needed
+for this pilot. Production promotion is a separate reviewed release after the
+existing PDF flow and new saved-output flow pass dev acceptance.
