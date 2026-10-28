@@ -44,3 +44,18 @@ approved-script execution disabled. The existing Marathon manual dev deployment
 remains the deployment path; a separate NanoClaw deployment trigger is not needed
 for this pilot. Production promotion is a separate reviewed release after the
 existing PDF flow and new saved-output flow pass dev acceptance.
+
+## Production release
+
+After production PR review and merge into `main`, build the separate script image
+with `cloudbuild_script_prod.yaml` in project `vault-249100`, using the reviewed
+commit as `SHORT_SHA` (or an explicit unique `_IMAGE_TAG`). It runs the same Python
+runtime tests with the image's pinned Counto client 0.1.1 before publishing only
+`nanoclaw-script`. This manual build does not deploy Marathon or change its agent
+image. Existing `main` merge automation can independently rebuild the unchanged
+agent image through `cloudbuild_prod.yaml`.
+
+Pin the resulting image digest in Marathon's existing production configuration.
+Keep approved-script admission disabled until the reviewed company binding and
+owner API rollout are ready for the normal validation run. The verified dev
+PayPal event/output test is release evidence; production requires its own test.
