@@ -1,5 +1,5 @@
 substitutions:
-  _REGION: asia-east2
+  _REGION: asia-southeast1
   _AR_REPO: marathon
   _IMAGE_NAME: nanoclaw-agent
   _IMAGE_TAG: latest
