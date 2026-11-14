@@ -1,10 +1,10 @@
 substitutions:
-  _REGION: asia-east2
+  _REGION: asia-southeast1
   _AR_REPO: marathon
   _IMAGE_NAME: nanoclaw-agent
   _IMAGE_TAG: latest
-  _VM_NAME: vault-prod-hk-clone
-  _VM_ZONE: asia-east2-a
+  _VM_NAME: vault-prod-hk-clone-sg
+  _VM_ZONE: asia-southeast1-c
   _VM_USER: alexandroskontogiorgos-heintz
 
 steps:
